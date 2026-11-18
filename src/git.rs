@@ -777,6 +777,8 @@ mod tests {
         let mut cfg = repo.config().unwrap();
         cfg.set_str("user.name", "Test").unwrap();
         cfg.set_str("user.email", "test@example.com").unwrap();
+        // Windows CI runners set core.autocrlf=true globally; keep checkouts byte-exact.
+        cfg.set_bool("core.autocrlf", false).unwrap();
         (dir, repo)
     }
 
