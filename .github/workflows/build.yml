@@ -10,12 +10,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install MinGW-w64 gcc (MSYS2)
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          install: mingw-w64-x86_64-gcc
-          location: C:\
+      - name: Install MinGW-w64 gcc (preinstalled MSYS2)
+        shell: pwsh
+        run: C:\msys64\usr\bin\pacman.exe -S --noconfirm --needed mingw-w64-x86_64-gcc
       - name: Build with build.ps1
         shell: pwsh
         run: .\build.ps1
