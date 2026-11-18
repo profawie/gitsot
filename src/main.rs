@@ -14,7 +14,7 @@ mod theme;
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Gitsot")
+            .with_title("gitsot")
             .with_app_id("gitsot")
             .with_inner_size([1200.0, 760.0])
             .with_min_inner_size([860.0, 520.0])
@@ -22,7 +22,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "Gitsot",
+        "gitsot",
         options,
         Box::new(|cc| Ok(Box::new(app::GitsotApp::new(cc)))),
     )

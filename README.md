@@ -87,7 +87,7 @@ If PowerShell blocks the scripts, run once: `Set-ExecutionPolicy -Scope CurrentU
 ### macOS / Linux
 
 ```bash
-./build.sh                # release build -> dist/gitsot (and dist/Gitsot.app on macOS)
+./build.sh                # release build -> dist/gitsot (and dist/gitsot.app on macOS)
 ./build.sh --debug        # debug build
 ./build.sh --windows      # cross-compile dist/gitsot.exe (needs mingw-w64)
 ./run.sh                  # build and start
