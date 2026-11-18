@@ -2,7 +2,7 @@
 
 A simple, friendly desktop Git client written in Rust. Same idea as GitHub Desktop, with fewer buttons.
 
-Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](https://github.com/emilk/egui) for the UI and [git2](https://github.com/rust-lang/git2-rs) (libgit2) for local Git work.
+Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](https://github.com/emilk/egui) for the UI, [git2](https://github.com/rust-lang/git2-rs) (libgit2) for local Git work and [alacritty_terminal](https://crates.io/crates/alacritty_terminal) for the built-in terminal.
 
 ## Features
 
@@ -13,6 +13,7 @@ Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](ht
 - **Branches**: switch, create, check out remote branches, and **merge** another branch into the current one (branch menu → *Merge into …*). If a merge has conflicts, the files are marked `!` in Changes; fix them and commit, or *Abort merge*. Delete local or remote branches with the bin icon in the branch menu (never the branch you are on).
 - **Remote**: Fetch, Pull and Push, with ahead/behind counts. New branches get a *Publish branch* button.
 - **History**: switch between a **Tree** view (the default) (coloured branch graph with branch, remote and tag labels) and a simple **List**, and see each commit's files and diffs.
+- **Terminal**: every repository has a built-in terminal that opens right in its folder (the *Terminal* button on its card, *Terminal* in the sidebar, or <kbd>Ctrl</kbd>+<kbd>`</kbd>). See [Terminal](#terminal) below.
 - Sidebar navigation, Settings and About pages, light and dark theme, auto-refresh when the window regains focus, <kbd>F5</kbd> to refresh.
 
 ## Identities (work vs personal accounts)
@@ -29,6 +30,34 @@ Before a **commit**, if the email that would be used is different from the folde
 Gitsot works with any Git host (GitHub, GitLab, Bitbucket, Gitea, self-hosted servers, …). It never uses `gh` or any host-specific tool.
 
 Clone, fetch, pull and push use the `git` command installed on your computer, so saved credentials and SSH keys keep working. Credential helpers are never allowed to open their own sign-in windows (such as Git Credential Manager's GitHub page). When an HTTPS remote needs a password and nothing is saved, Gitsot shows one plain *Sign in* dialog (username + password or access token), and your credential store remembers it if one is configured. Everything else is done in-process with libgit2.
+
+## Terminal
+
+Clone or open a repository, click **Terminal**, and you are in a shell inside that folder. No separate terminal window to open and `cd` around in.
+
+![The built-in terminal with the Gitsot prompt](docs/terminal.png)
+
+- **Windows**: PowerShell (PowerShell 7 `pwsh` if it is installed, otherwise Windows PowerShell).
+- **macOS**: zsh, started as a login shell like Terminal.app. **Linux**: your zsh or bash.
+
+Your own shell profile is loaded as usual. After it, Gitsot adds its own prompt: before every command, one line of labelled chips shows
+
+| Chip | Meaning |
+| --- | --- |
+| folder | where you are, relative to the repository |
+| branch | the current branch (or `detached at <commit>`) |
+| `2 to push` / `1 to pull` / `not published` | how the branch compares with its remote |
+| `1 staged, 2 changed, 1 new` or `clean` | what is waiting to be committed; conflicts get their own red chip |
+| person | the **email your next commit will use**, so a work/personal mix-up is visible before you commit |
+| clock, `exit 1` | how long the last command took (3 s or more) and whether it failed |
+
+The chips and icons are drawn by Gitsot itself: no Nerd Font, oh-my-posh or other install is needed. The files of your own shell setup are never changed. Prefer your own prompt? Turn off Settings → Terminal → **Gitsot prompt**.
+
+Good to know:
+
+- Each repository keeps its own terminal running while you look at other pages or repositories. *Restart* starts a fresh shell; *Close repository* ends it.
+- When a command finishes, Changes and History are refreshed, so what you did in the terminal shows up right away.
+- Copy with <kbd>Ctrl</kbd>+<kbd>C</kbd> when text is selected (otherwise it interrupts, as usual) or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>; paste with <kbd>Ctrl</kbd>+<kbd>V</kbd> (<kbd>Cmd</kbd>+<kbd>C</kbd>/<kbd>V</kbd> on macOS). Scroll back with the mouse wheel or <kbd>Shift</kbd>+<kbd>PageUp</kbd>.
 
 ## Requirements
 
@@ -77,6 +106,10 @@ The Windows `.exe` is self-contained: no MinGW DLLs are needed at runtime.
 | `src/graph.rs` | Lays out the history tree (lanes and branch lines) |
 | `src/git.rs` | Local Git operations with libgit2 (status, diff, stage, commit, branches, history) |
 | `src/identity.rs` | Global/repository identities, folder rules (`includeIf`) and mismatch checks |
+| `src/term.rs` | One built-in terminal: the shell in a pseudo-terminal and its screen (`alacritty_terminal`) |
+| `src/term_view.rs` | Draws the terminal, including the prompt's chips and icons, and handles keys and mouse |
+| `src/shell.rs` | Picks the shell (PowerShell / zsh / bash) and loads the Gitsot prompt into it |
+| `assets/prompt.ps1`, `assets/prompt.sh` | The Gitsot prompt for PowerShell and for zsh/bash |
 | `src/cli.rs` | Network operations through the `git` command, run in the background |
 
 ## Tests

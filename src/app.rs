@@ -16,13 +16,15 @@ use crate::git::{
 };
 use crate::graph::{self, Graph};
 use crate::identity::{self, FolderRule, Identity};
-use crate::theme;
+use crate::term::Terminal;
+use crate::{shell, term_view, theme};
 use std::collections::HashMap;
 
 const SETTINGS_KEY: &str = "gitsot-settings";
 const MAX_RECENT: usize = 12;
 /// Git logo glyph from egui's bundled icon font, used as the "branch" icon.
 const BRANCH_ICON: &str = "\u{E625}";
+const TERMINAL_SHORTCUT: &str = "Ctrl+`";
 
 // ---------------------------------------------------------------------------
 // Persistent settings
@@ -43,6 +45,9 @@ struct Settings {
     group_names: Vec<String>,
     /// Groups folded shut on the Repositories page.
     collapsed_groups: Vec<String>,
+    /// Load Gitsot's prompt (labelled chips) into the built-in terminal.
+    terminal_prompt: bool,
+    terminal_font_size: f32,
 }
 
 impl Default for Settings {
@@ -56,6 +61,8 @@ impl Default for Settings {
             groups: HashMap::new(),
             group_names: Vec::new(),
             collapsed_groups: Vec::new(),
+            terminal_prompt: true,
+            terminal_font_size: 14.0,
         }
     }
 }
@@ -240,6 +247,7 @@ enum Page {
     Repositories,
     Changes,
     History,
+    Terminal,
     Settings,
     About,
 }
@@ -297,6 +305,11 @@ enum Dialog {
 enum Action {
     OpenDialog,
     OpenPath(PathBuf),
+    /// Open the built-in terminal in a repository (opening it first if needed).
+    OpenTerminal(PathBuf),
+    RestartTerminal,
+    SetTerminalPrompt(bool),
+    SetTerminalFontSize(f32),
     InitDialog,
     ShowClone,
     CloseRepo,
@@ -373,6 +386,9 @@ pub struct GitsotApp {
     was_focused: bool,
     /// Username typed into the last sign-in dialog, to pre-fill a retry.
     last_username: String,
+    /// Built-in terminals, at most one per repository. They keep running
+    /// while another repository or page is shown.
+    terminals: Vec<Terminal>,
 }
 
 impl GitsotApp {
@@ -402,6 +418,7 @@ impl GitsotApp {
             git_cli: cli::git_available(),
             was_focused: true,
             last_username: String::new(),
+            terminals: Vec::new(),
         };
         theme::apply(&cc.egui_ctx, app.settings.light_mode);
 
@@ -484,6 +501,22 @@ impl GitsotApp {
                 }
             }
             Action::OpenPath(p) => self.open_repo(&p),
+            Action::OpenTerminal(p) => {
+                if self.repo.as_ref().is_none_or(|r| r.path != p) {
+                    self.open_repo(&p);
+                }
+                if self.repo.is_some() {
+                    self.page = Page::Terminal;
+                }
+            }
+            Action::RestartTerminal => {
+                if let Some(path) = self.repo.as_ref().map(|r| r.path.clone()) {
+                    self.terminals.retain(|t| t.repo != path);
+                    self.start_terminal(ctx, &path);
+                }
+            }
+            Action::SetTerminalPrompt(on) => self.settings.terminal_prompt = on,
+            Action::SetTerminalFontSize(size) => self.settings.terminal_font_size = size,
             Action::InitDialog => {
                 if let Some(dir) = rfd::FileDialog::new()
                     .set_title("Choose a folder for the new repository")
@@ -518,6 +551,10 @@ impl GitsotApp {
                 });
             }
             Action::CloseRepo => {
+                // Closing a repository also ends its terminal.
+                if let Some(r) = &self.repo {
+                    self.terminals.retain(|t| t.repo != r.path);
+                }
                 self.repo = None;
                 self.settings.last_repo = None;
                 self.page = Page::Repositories;
@@ -535,6 +572,10 @@ impl GitsotApp {
                 theme::apply(ctx, light);
             }
             Action::GoTo(page) => {
+                // Commands typed in the terminal may have changed anything.
+                if self.page == Page::Terminal && page != Page::Terminal {
+                    self.refresh();
+                }
                 if page == Page::Repositories {
                     self.reload_cards();
                 }
@@ -979,14 +1020,22 @@ impl GitsotApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        let refresh = ctx.input_mut(|i| {
-            i.consume_key(Modifiers::NONE, Key::F5) || i.consume_key(Modifiers::COMMAND, Key::R)
-        });
-        if refresh {
-            actions.push(Action::Refresh);
+        // Ctrl+` switches between the terminal and Changes.
+        if self.repo.is_some() && self.dialog.is_none() && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backtick)) {
+            actions.push(Action::GoTo(if self.page == Page::Terminal { Page::Changes } else { Page::Terminal }));
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
-            actions.push(Action::OpenDialog);
+        // In the terminal every other key belongs to the shell (Ctrl+R
+        // searches its history, for one).
+        if self.page != Page::Terminal {
+            let refresh = ctx.input_mut(|i| {
+                i.consume_key(Modifiers::NONE, Key::F5) || i.consume_key(Modifiers::COMMAND, Key::R)
+            });
+            if refresh {
+                actions.push(Action::Refresh);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
+                actions.push(Action::OpenDialog);
+            }
         }
 
         // Re-read the repository when the window regains focus, so edits made
@@ -1104,7 +1153,7 @@ impl eframe::App for GitsotApp {
         let mut actions = Vec::new();
         self.handle_shortcuts(&ctx, &mut actions);
 
-        if self.repo.is_none() && matches!(self.page, Page::Changes | Page::History) {
+        if self.repo.is_none() && matches!(self.page, Page::Changes | Page::History | Page::Terminal) {
             self.page = Page::Repositories;
         }
 
@@ -1115,6 +1164,7 @@ impl eframe::App for GitsotApp {
             .show(ui, |ui| match self.page {
                 Page::Repositories => self.repositories_page(ui, &mut actions),
                 Page::Changes | Page::History => self.repo_page(ui, &mut actions),
+                Page::Terminal => self.terminal_page(ui, &mut actions),
                 Page::Settings => self.settings_page(ui, &mut actions),
                 Page::About => about_page(ui),
             });
@@ -1168,6 +1218,12 @@ impl GitsotApp {
                     }
                     if theme::nav_item(ui, page == Page::History, "History", None).clicked() {
                         actions.push(Action::GoTo(Page::History));
+                    }
+                    if theme::nav_item(ui, page == Page::Terminal, "Terminal", None)
+                        .on_hover_text(format!("A terminal in this repository ({TERMINAL_SHORTCUT})"))
+                        .clicked()
+                    {
+                        actions.push(Action::GoTo(Page::Terminal));
                     }
                 }
 
@@ -1426,6 +1482,65 @@ impl GitsotApp {
         }
     }
 
+    /// Start a terminal for `path`, replacing nothing: callers remove the old one first.
+    fn start_terminal(&mut self, ctx: &egui::Context, path: &Path) {
+        let launch = shell::launch(path, self.settings.terminal_prompt);
+        let ctx = ctx.clone();
+        match Terminal::open(path, launch, move || ctx.request_repaint()) {
+            Ok(terminal) => self.terminals.push(terminal),
+            Err(e) => self.error(format!("Could not start the terminal: {e:#}")),
+        }
+    }
+
+    fn terminal_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let Some(path) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
+        let mut failed = false;
+        if !self.terminals.iter().any(|t| t.repo == path) {
+            let ctx = ui.ctx().clone();
+            self.start_terminal(&ctx, &path);
+            failed = !self.terminals.iter().any(|t| t.repo == path);
+        }
+        if failed {
+            // Don't try again on every frame; the error is in the status bar.
+            self.page = Page::Changes;
+            return;
+        }
+        let interactive = self.dialog.is_none();
+        let font_size = self.settings.terminal_font_size;
+        let Some(r) = self.repo.as_ref() else { return };
+        let Some(terminal) = self.terminals.iter_mut().find(|t| t.repo == path) else { return };
+        terminal.poll();
+        // The prompt came back: a command finished, so re-read the repository.
+        let refresh = terminal.take_prompt_shown();
+
+        egui::Panel::top("terminal_header")
+            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 20, right: 20, top: 14, bottom: 10 }))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Terminal").size(24.0).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Restart").on_hover_text("End this shell and start a new one").clicked() {
+                            actions.push(Action::RestartTerminal);
+                        }
+                        let state = if terminal.is_running() { terminal.shell.clone() } else { format!("{} (ended)", terminal.shell) };
+                        ui.label(RichText::new(state).weak());
+                    });
+                });
+                ui.add(egui::Label::new(RichText::new(format!("{}  ·  {}", r.name(), r.path.display())).weak()).truncate());
+            });
+
+        let p = theme::pal(ui);
+        let fill = term_view::background(&p, ui.visuals().dark_mode);
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(fill)).show(ui, |ui| {
+            if term_view::show(ui, terminal, font_size, interactive).restart {
+                actions.push(Action::RestartTerminal);
+            }
+        });
+        if refresh {
+            actions.push(Action::Refresh);
+        }
+    }
+
     fn settings_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         page_frame(ui, |ui| {
             theme::page_header(ui, "Settings", "Appearance, commit identities and Git.");
@@ -1545,6 +1660,33 @@ impl GitsotApp {
                 if theme::primary_enabled(ui, ok, "Add rule").clicked() {
                     actions.push(Action::AddRule { folder: self.rule_form.0.clone(), identity: self.rule_form.1.clone() });
                 }
+
+                ui.add_space(20.0);
+                theme::section(
+                    ui,
+                    "Terminal",
+                    "The built-in terminal opens in the repository folder: PowerShell on Windows, zsh on macOS.",
+                );
+                let mut prompt = self.settings.terminal_prompt;
+                if ui
+                    .checkbox(&mut prompt, "Gitsot prompt")
+                    .on_hover_text("Shows folder, branch, changes, what to push or pull and the commit identity before every command.")
+                    .changed()
+                {
+                    actions.push(Action::SetTerminalPrompt(prompt));
+                }
+                ui.label(
+                    RichText::new("Loaded after your own shell profile. Turn it off to keep your own prompt. Applies to terminals started from now on.")
+                        .small()
+                        .weak(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Text size");
+                    let mut size = self.settings.terminal_font_size;
+                    if ui.add(egui::Slider::new(&mut size, 11.0..=20.0).step_by(1.0).fixed_decimals(0)).changed() {
+                        actions.push(Action::SetTerminalFontSize(size));
+                    }
+                });
 
                 ui.add_space(20.0);
                 theme::section(ui, "Git command", "");
@@ -2077,9 +2219,19 @@ fn repo_card_body(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f
         }
         ui.add_space(6.0);
         let label = if is_current { "Go to changes" } else { "Open" };
-        if theme::primary_wide(ui, card.exists, label, 28.0).clicked() {
-            actions.push(if is_current { Action::GoTo(Page::Changes) } else { Action::OpenPath(card.path.clone()) });
-        }
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let terminal = ui
+                    .add_enabled(card.exists, egui::Button::new(">_  Terminal").min_size(Vec2::new(0.0, 28.0)))
+                    .on_hover_text("Open a terminal in this repository");
+                if terminal.clicked() {
+                    actions.push(Action::OpenTerminal(card.path.clone()));
+                }
+                if theme::primary_wide(ui, card.exists, label, 28.0).clicked() {
+                    actions.push(if is_current { Action::GoTo(Page::Changes) } else { Action::OpenPath(card.path.clone()) });
+                }
+            });
+        });
     }
 }
 

@@ -6,6 +6,9 @@ mod cli;
 mod git;
 mod graph;
 mod identity;
+mod shell;
+mod term;
+mod term_view;
 mod theme;
 
 fn main() -> eframe::Result {
