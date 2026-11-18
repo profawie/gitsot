@@ -6,14 +6,14 @@ Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](ht
 
 ## Features
 
-- **Repositories**: open a local repository, clone from a URL, or create a new one. Recent repositories are remembered.
+- **Repositories**: your repositories as cards (branch + host at a glance). Open a local folder, clone from a URL, or create a new one.
 - **Changes**: see every changed file, tick the ones to include (stage), untick to unstage, and view a coloured diff.
 - **Commit**: summary + description, then *Commit to &lt;branch&gt;* (or <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>Enter</kbd>). If your Git name/email are not set, Gitsot asks for them once.
 - **Discard**: right-click a file (or *Discard all…*) to throw away changes, with a confirmation.
 - **Branches**: switch, create, delete (right-click), and check out remote branches.
 - **Remote**: Fetch, Pull and Push, with ahead/behind counts. New branches get a *Publish branch* button.
-- **History**: browse commits, see the files each one changed and their diffs.
-- Light and dark theme, auto-refresh when the window regains focus, <kbd>F5</kbd> to refresh.
+- **History**: switch between a simple **List** and a **Tree** view (coloured branch graph with branch, remote and tag labels), and see each commit's files and diffs.
+- Sidebar navigation, Settings (theme, Git name/email) and About pages, light and dark theme, auto-refresh when the window regains focus, <kbd>F5</kbd> to refresh.
 
 Gitsot works with any Git host (GitHub, GitLab, Bitbucket, Gitea, self-hosted servers, …). It never uses `gh` or any host-specific tool.
 
@@ -61,7 +61,9 @@ The Windows `.exe` is self-contained: no MinGW DLLs are needed at runtime.
 | File | What it does |
 | --- | --- |
 | `src/main.rs` | Window setup |
-| `src/app.rs` | All the UI: toolbar, changes, history, dialogs, diff viewer |
+| `src/app.rs` | All the UI: sidebar, repository cards, changes, history, settings, dialogs, diff viewer |
+| `src/theme.rs` | Colours, blue buttons, logo, cards |
+| `src/graph.rs` | Lays out the history tree (lanes and branch lines) |
 | `src/git.rs` | Local Git operations with libgit2 (status, diff, stage, commit, branches, history) |
 | `src/cli.rs` | Network operations through the `git` command, run in the background |
 

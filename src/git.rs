@@ -117,6 +117,22 @@ pub struct CommitInfo {
     pub author: String,
     pub email: String,
     pub time: i64,
+    pub parents: Vec<Oid>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefKind {
+    Local,
+    Remote,
+    Tag,
+}
+
+/// A branch / remote branch / tag pointing at a commit, shown as a label in history.
+#[derive(Clone, Debug)]
+pub struct RefLabel {
+    pub name: String,
+    pub kind: RefKind,
+    pub is_head: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -609,9 +625,16 @@ pub fn commit_file_diff(repo: &Repository, id: Oid, path: &str) -> Result<FileDi
 // History
 // ---------------------------------------------------------------------------
 
-pub fn history(repo: &Repository, limit: usize) -> Result<Vec<CommitInfo>> {
+/// Commits reachable from HEAD, or from every branch and tag when `all_refs` is set
+/// (used by the tree view so other branches show up in the graph).
+pub fn history(repo: &Repository, limit: usize, all_refs: bool) -> Result<Vec<CommitInfo>> {
     let mut walk = repo.revwalk()?;
-    if walk.push_head().is_err() {
+    let has_head = walk.push_head().is_ok();
+    if all_refs {
+        let _ = walk.push_glob("refs/heads/*");
+        let _ = walk.push_glob("refs/remotes/*");
+        let _ = walk.push_glob("refs/tags/*");
+    } else if !has_head {
         return Ok(Vec::new()); // no commits yet
     }
     walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
@@ -628,9 +651,46 @@ pub fn history(repo: &Repository, limit: usize) -> Result<Vec<CommitInfo>> {
             author: author.name().unwrap_or("Unknown").to_string(),
             email: author.email().unwrap_or("").to_string(),
             time: c.time().seconds(),
+            parents: c.parent_ids().collect(),
         });
     }
     Ok(out)
+}
+
+/// Every branch, remote branch and tag, grouped by the commit it points at.
+pub fn ref_labels(repo: &Repository) -> std::collections::HashMap<Oid, Vec<RefLabel>> {
+    let mut map: std::collections::HashMap<Oid, Vec<RefLabel>> = Default::default();
+    let head_name = repo
+        .head()
+        .ok()
+        .filter(|h| h.is_branch())
+        .and_then(|h| h.name().ok().map(str::to_string));
+    let Ok(refs) = repo.references() else { return map };
+    for r in refs.flatten() {
+        let Ok(full) = r.name().map(str::to_string) else { continue };
+        let (kind, name) = if let Some(n) = full.strip_prefix("refs/heads/") {
+            (RefKind::Local, n.to_string())
+        } else if let Some(n) = full.strip_prefix("refs/remotes/") {
+            if n.ends_with("/HEAD") {
+                continue;
+            }
+            (RefKind::Remote, n.to_string())
+        } else if let Some(n) = full.strip_prefix("refs/tags/") {
+            (RefKind::Tag, n.to_string())
+        } else {
+            continue;
+        };
+        let Ok(commit) = r.peel_to_commit() else { continue };
+        map.entry(commit.id()).or_default().push(RefLabel {
+            is_head: head_name.as_deref() == Some(full.as_str()),
+            name,
+            kind,
+        });
+    }
+    for labels in map.values_mut() {
+        labels.sort_by_key(|l| (!l.is_head, l.kind as u8, l.name.clone()));
+    }
+    map
 }
 
 // ---------------------------------------------------------------------------
@@ -815,7 +875,11 @@ mod tests {
         stage(&repo, &["a.txt".into()]).unwrap();
         let second = commit(&repo, "Second").unwrap();
 
-        let log = history(&repo, 10).unwrap();
+        let log = history(&repo, 10, false).unwrap();
+        assert_eq!(log[0].parents, vec![first]);
+        assert_eq!(history(&repo, 10, true).unwrap().len(), 2);
+        let labels = ref_labels(&repo);
+        assert!(labels[&second].iter().any(|l| l.name == "feature" && l.is_head));
         assert_eq!(log.len(), 2);
         assert_eq!(log[0].id, second);
         assert_eq!(log[1].id, first);
