@@ -3,17 +3,25 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, FontId, Key, KeyboardShortcut, Layout, Modifiers, RichText,
-    Sense, TextEdit, Vec2,
+    self, Align, Align2, Color32, FontId, Key, KeyboardShortcut, Layout, Modifiers, Pos2, RichText,
+    Sense, Stroke, TextEdit, Vec2,
 };
 use git2::{Oid, Repository};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{self, Credentials, NetOp, NetResult};
-use crate::git::{self, BranchInfo, ChangeKind, CommitFile, CommitInfo, FileChange, FileDiff, HeadInfo, LineKind};
+use crate::git::{
+    self, BranchInfo, ChangeKind, CommitFile, CommitInfo, FileChange, FileDiff, HeadInfo, LineKind, RefKind,
+    RefLabel,
+};
+use crate::graph::{self, Graph};
+use crate::theme;
+use std::collections::HashMap;
 
 const SETTINGS_KEY: &str = "gitsot-settings";
 const MAX_RECENT: usize = 12;
+/// Git logo glyph from egui's bundled icon font, used as the "branch" icon.
+const BRANCH_ICON: &str = "\u{E625}";
 
 // ---------------------------------------------------------------------------
 // Persistent settings
@@ -26,6 +34,8 @@ struct Settings {
     last_repo: Option<PathBuf>,
     clone_parent: Option<PathBuf>,
     light_mode: bool,
+    /// Show history as a branch tree instead of a plain list.
+    history_tree: bool,
 }
 
 impl Settings {
@@ -55,6 +65,10 @@ struct RepoView {
 
     history: Vec<CommitInfo>,
     history_loaded: bool,
+    /// History includes every branch (tree view) rather than just HEAD.
+    history_all: bool,
+    graph: Graph,
+    labels: HashMap<Oid, Vec<RefLabel>>,
     selected_commit: Option<Oid>,
     commit_files: Vec<CommitFile>,
     selected_commit_file: Option<String>,
@@ -82,6 +96,9 @@ impl RepoView {
             description: String::new(),
             history: Vec::new(),
             history_loaded: false,
+            history_all: false,
+            graph: Graph::default(),
+            labels: HashMap::new(),
             selected_commit: None,
             commit_files: Vec::new(),
             selected_commit_file: None,
@@ -117,7 +134,7 @@ impl RepoView {
         self.load_change_diff();
 
         if self.history_loaded {
-            self.load_history();
+            self.load_history(self.history_all);
         }
         Ok(())
     }
@@ -129,9 +146,12 @@ impl RepoView {
             .map(|p| git::working_diff(&self.repo, p).map_err(|e| e.to_string()));
     }
 
-    fn load_history(&mut self) {
-        self.history = git::history(&self.repo, git::MAX_HISTORY).unwrap_or_default();
+    fn load_history(&mut self, all_refs: bool) {
+        self.history = git::history(&self.repo, git::MAX_HISTORY, all_refs).unwrap_or_default();
         self.history_loaded = true;
+        self.history_all = all_refs;
+        self.labels = git::ref_labels(&self.repo);
+        self.graph = if all_refs { graph::layout(&self.history) } else { Graph::default() };
         let still_there = self
             .selected_commit
             .map(|id| self.history.iter().any(|c| c.id == id) && git::commit_exists(&self.repo, id))
@@ -179,9 +199,34 @@ fn strip_unc(p: PathBuf) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab {
+enum Page {
+    Repositories,
     Changes,
     History,
+    Settings,
+    About,
+}
+
+/// What the Repositories page shows for one remembered repository.
+struct RepoCard {
+    path: PathBuf,
+    name: String,
+    branch: Option<String>,
+    remote: Option<String>,
+    exists: bool,
+}
+
+impl RepoCard {
+    fn load(path: &Path) -> Self {
+        let repo = git::open(path).ok();
+        RepoCard {
+            path: path.to_path_buf(),
+            name: git::repo_name(path),
+            branch: repo.as_ref().map(|r| git::head_info(r).display_name()),
+            remote: repo.as_ref().and_then(git::remote_url),
+            exists: repo.is_some(),
+        }
+    }
 }
 
 enum Dialog {
@@ -221,13 +266,14 @@ enum Action {
     Net(NetOp),
     NetWithCredentials(NetOp, Credentials),
     StartClone { url: String, parent: String, name: String },
-    LoadHistory,
     SelectCommit(Oid),
     SelectCommitFile(String),
     RevealInFiles,
     CopyToClipboard(String),
-    ToggleTheme,
+    SetLightMode(bool),
     ForgetRecent(PathBuf),
+    GoTo(Page),
+    SetHistoryTree(bool),
 }
 
 struct Toast {
@@ -239,7 +285,10 @@ struct Toast {
 pub struct GitsotApp {
     settings: Settings,
     repo: Option<RepoView>,
-    tab: Tab,
+    page: Page,
+    cards: Vec<RepoCard>,
+    repo_filter: String,
+    identity: (String, String),
     dialog: Option<Dialog>,
     toast: Option<Toast>,
     busy: Option<String>,
@@ -261,7 +310,10 @@ impl GitsotApp {
         let mut app = Self {
             settings,
             repo: None,
-            tab: Tab::Changes,
+            page: Page::Repositories,
+            cards: Vec::new(),
+            repo_filter: String::new(),
+            identity: git::identity(None),
             dialog: None,
             toast: None,
             busy: None,
@@ -271,8 +323,7 @@ impl GitsotApp {
             was_focused: true,
             last_username: String::new(),
         };
-        app.apply_theme(&cc.egui_ctx);
-        configure_style(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx, app.settings.light_mode);
 
         let start = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| app.settings.last_repo.clone());
         if let Some(path) = start {
@@ -284,15 +335,12 @@ impl GitsotApp {
                 }
             }
         }
+        app.reload_cards();
         app
     }
 
-    fn apply_theme(&self, ctx: &egui::Context) {
-        ctx.set_theme(if self.settings.light_mode {
-            egui::Theme::Light
-        } else {
-            egui::Theme::Dark
-        });
+    fn reload_cards(&mut self) {
+        self.cards = self.settings.recent.iter().map(|p| RepoCard::load(p)).collect();
     }
 
     fn info(&mut self, text: impl Into<String>) {
@@ -314,7 +362,8 @@ impl GitsotApp {
                 self.settings.remember(&view.path);
                 self.info(format!("Opened {}", view.name()));
                 self.repo = Some(view);
-                self.tab = Tab::Changes;
+                self.page = Page::Changes;
+                self.reload_cards();
             }
             Err(e) => self.error(format!("{e:#}")),
         }
@@ -377,14 +426,41 @@ impl GitsotApp {
             Action::CloseRepo => {
                 self.repo = None;
                 self.settings.last_repo = None;
+                self.page = Page::Repositories;
+                self.reload_cards();
             }
             Action::Refresh => {
                 self.refresh();
             }
-            Action::ForgetRecent(p) => self.settings.recent.retain(|r| r != &p),
-            Action::ToggleTheme => {
-                self.settings.light_mode = !self.settings.light_mode;
-                self.apply_theme(ctx);
+            Action::ForgetRecent(p) => {
+                self.settings.recent.retain(|r| r != &p);
+                self.reload_cards();
+            }
+            Action::SetLightMode(light) => {
+                self.settings.light_mode = light;
+                theme::apply(ctx, light);
+            }
+            Action::GoTo(page) => {
+                if page == Page::Repositories {
+                    self.reload_cards();
+                }
+                if page == Page::Settings {
+                    self.identity = git::identity(None);
+                }
+                if page == Page::History {
+                    if let Some(r) = &mut self.repo {
+                        if !r.history_loaded || r.history_all != self.settings.history_tree {
+                            r.load_history(self.settings.history_tree);
+                        }
+                    }
+                }
+                self.page = page;
+            }
+            Action::SetHistoryTree(tree) => {
+                self.settings.history_tree = tree;
+                if let Some(r) = &mut self.repo {
+                    r.load_history(tree);
+                }
             }
             Action::CopyToClipboard(text) => {
                 ctx.copy_text(text);
@@ -404,6 +480,7 @@ impl GitsotApp {
                 }
                 match git::set_global_identity(&name, &email) {
                     Ok(()) => {
+                        self.identity = (name.trim().to_string(), email.trim().to_string());
                         self.dialog = None;
                         if commit_after {
                             self.apply(ctx, Action::Commit);
@@ -493,10 +570,6 @@ impl GitsotApp {
                             git::delete_branch(&r.repo, &name)?;
                             r.refresh()?;
                             return Ok(Some(format!("Deleted branch {name}")));
-                        }
-                        Action::LoadHistory => {
-                            r.load_history();
-                            return Ok(None);
                         }
                         Action::SelectCommit(id) => {
                             r.select_commit(Some(id));
@@ -653,14 +726,6 @@ impl GitsotApp {
     }
 }
 
-fn configure_style(ctx: &egui::Context) {
-    ctx.all_styles_mut(|style| {
-        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        style.spacing.button_padding = Vec2::new(10.0, 5.0);
-        style.spacing.interact_size.y = 26.0;
-    });
-}
-
 fn default_clone_parent() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     let docs = PathBuf::from(&home).join("Documents");
@@ -766,14 +831,20 @@ impl eframe::App for GitsotApp {
         let mut actions = Vec::new();
         self.handle_shortcuts(&ctx, &mut actions);
 
-        self.toolbar(ui, &mut actions);
-        self.status_bar(ui);
-
-        if self.repo.is_some() {
-            self.repo_ui(ui, &mut actions);
-        } else {
-            self.welcome(ui, &mut actions);
+        if self.repo.is_none() && matches!(self.page, Page::Changes | Page::History) {
+            self.page = Page::Repositories;
         }
+
+        self.nav_sidebar(ui, &mut actions);
+        self.status_bar(ui);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::same(0)))
+            .show(ui, |ui| match self.page {
+                Page::Repositories => self.repositories_page(ui, &mut actions),
+                Page::Changes | Page::History => self.repo_page(ui, &mut actions),
+                Page::Settings => self.settings_page(ui, &mut actions),
+                Page::About => about_page(ui),
+            });
 
         self.dialogs(&ctx, &mut actions);
 
@@ -796,33 +867,140 @@ impl eframe::App for GitsotApp {
 }
 
 impl GitsotApp {
-    fn toolbar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(4.0);
+    fn nav_sidebar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let dark = ui.visuals().dark_mode;
+        egui::Panel::left("nav")
+            .resizable(false)
+            .exact_size(200.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::nav_bg(dark))
+                    .inner_margin(egui::Margin { left: 12, right: 12, top: 16, bottom: 10 }),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::logo(ui, 26.0);
+                    ui.label(RichText::new("gitsot").size(20.0).strong());
+                });
+                ui.add_space(18.0);
+
+                let page = self.page;
+                if theme::nav_item(ui, page == Page::Repositories, "Repositories", None).clicked() {
+                    actions.push(Action::GoTo(Page::Repositories));
+                }
+
+                if let Some(r) = &self.repo {
+                    ui.add_space(14.0);
+                    ui.add(egui::Label::new(RichText::new(r.name().to_uppercase()).small().weak()).truncate())
+                        .on_hover_text(r.path.display().to_string());
+                    ui.add_space(2.0);
+                    if theme::nav_item(ui, page == Page::Changes, "Changes", Some(r.changes.len())).clicked() {
+                        actions.push(Action::GoTo(Page::Changes));
+                    }
+                    if theme::nav_item(ui, page == Page::History, "History", None).clicked() {
+                        actions.push(Action::GoTo(Page::History));
+                    }
+                }
+
+                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                    ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).small().weak());
+                    ui.add_space(4.0);
+                    if theme::nav_item(ui, page == Page::About, "About", None).clicked() {
+                        actions.push(Action::GoTo(Page::About));
+                    }
+                    if theme::nav_item(ui, page == Page::Settings, "Settings", None).clicked() {
+                        actions.push(Action::GoTo(Page::Settings));
+                    }
+                });
+            });
+    }
+
+    fn repositories_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        page_frame(ui, |ui| {
             ui.horizontal(|ui| {
-                // Repository picker
-                let repo_label = self
-                    .repo
-                    .as_ref()
-                    .map(|r| r.name())
-                    .unwrap_or_else(|| "No repository".into());
                 ui.vertical(|ui| {
-                    ui.label(RichText::new("Current repository").small().weak());
-                    ui.menu_button(RichText::new(format!("{repo_label}  ⏷")).strong(), |ui| {
-                        ui.set_min_width(260.0);
-                        if ui.button("Open local repository…").clicked() {
-                            actions.push(Action::OpenDialog);
-                            ui.close();
+                    ui.label(RichText::new("Repositories").size(26.0).strong());
+                    ui.label(RichText::new("Git repositories you work with. Any Git host works.").weak());
+                });
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    if theme::primary(ui, "+ New").on_hover_text("Create a new repository").clicked() {
+                        actions.push(Action::InitDialog);
+                    }
+                    if theme::primary(ui, "Clone").on_hover_text("Clone a repository from a URL").clicked() {
+                        actions.push(Action::ShowClone);
+                    }
+                    if theme::primary(ui, "Open folder").on_hover_text("Open a repository on this computer (Ctrl+O)").clicked() {
+                        actions.push(Action::OpenDialog);
+                    }
+                    ui.add(TextEdit::singleline(&mut self.repo_filter).hint_text("Search repositories").desired_width(200.0));
+                });
+            });
+            ui.add_space(18.0);
+
+            if self.cards.is_empty() {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    theme::logo(ui, 56.0);
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("No repositories yet").size(18.0));
+                    ui.label(RichText::new("Open a folder, clone from a URL, or create a new repository.").weak());
+                });
+                return;
+            }
+
+            let filter = self.repo_filter.to_lowercase();
+            let cards: Vec<&RepoCard> = self
+                .cards
+                .iter()
+                .filter(|c| filter.is_empty() || c.name.to_lowercase().contains(&filter) || c.path.to_string_lossy().to_lowercase().contains(&filter))
+                .collect();
+            ui.label(RichText::new(format!("Recent  ({})", cards.len())).small().weak());
+            ui.add_space(6.0);
+
+            let current = self.repo.as_ref().map(|r| r.path.clone());
+            let card_w = 280.0;
+            let gap = 14.0;
+            let per_row = (((ui.available_width() + gap) / (card_w + gap)).floor() as usize).max(1);
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                for chunk in cards.chunks(per_row) {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for card in chunk {
+                            let is_current = current.as_ref() == Some(&card.path);
+                            repo_card(ui, card, is_current, card_w, actions);
                         }
-                        if ui.button("Clone repository…").clicked() {
-                            actions.push(Action::ShowClone);
-                            ui.close();
-                        }
-                        if ui.button("Create new repository…").clicked() {
-                            actions.push(Action::InitDialog);
-                            ui.close();
-                        }
-                        if self.repo.is_some() {
+                    });
+                    ui.add_space(gap);
+                }
+            });
+        });
+    }
+
+    fn repo_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let busy = self.busy.is_some();
+        let page = self.page;
+        let history_tree = self.settings.history_tree;
+        let Some(r) = self.repo.as_mut() else { return };
+
+        // Header: repository name, branch picker and remote buttons.
+        egui::Panel::top("repo_header")
+            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 20, right: 20, top: 14, bottom: 10 }))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(if page == Page::Changes { "Changes" } else { "History" }).size(24.0).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        remote_buttons(ui, r, busy, actions);
+                        ui.add_space(4.0);
+                        ui.menu_button(RichText::new(format!("{BRANCH_ICON}  {}  ⏷", r.head.display_name())), |ui| {
+                            branch_menu(ui, r, actions)
+                        })
+                        .response
+                        .on_hover_text("Current branch: switch or create branches");
+                        ui.menu_button("☰", |ui| {
+                            if ui.button("Refresh (F5)").clicked() {
+                                actions.push(Action::Refresh);
+                                ui.close();
+                            }
                             if ui.button("Show in file manager").clicked() {
                                 actions.push(Action::RevealInFiles);
                                 ui.close();
@@ -831,101 +1009,97 @@ impl GitsotApp {
                                 actions.push(Action::CloseRepo);
                                 ui.close();
                             }
-                        }
-                        if !self.settings.recent.is_empty() {
-                            ui.separator();
-                            ui.label(RichText::new("Recent").small().weak());
-                            for p in &self.settings.recent {
-                                let current = self.repo.as_ref().map(|r| &r.path == p).unwrap_or(false);
-                                if ui
-                                    .add(egui::Button::selectable(current, git::repo_name(p)))
-                                    .on_hover_text(p.display().to_string())
-                                    .clicked()
-                                {
-                                    actions.push(Action::OpenPath(p.clone()));
-                                    ui.close();
-                                }
-                            }
+                        });
+                        if page == Page::History {
+                            ui.add_space(8.0);
+                            segmented(ui, history_tree, actions);
                         }
                     });
                 });
+                ui.add(
+                    egui::Label::new(RichText::new(format!("{}  ·  {}", r.name(), r.path.display())).weak()).truncate(),
+                );
+            });
 
-                if let Some(r) = &mut self.repo {
-                    ui.separator();
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("Current branch").small().weak());
-                        ui.menu_button(
-                            RichText::new(format!("{}  ⏷", r.head.display_name())).strong(),
-                            |ui| branch_menu(ui, r, actions),
-                        );
-                    });
+        match page {
+            Page::Changes => {
+                egui::Panel::left("changes_list")
+                    .resizable(true)
+                    .default_size(340.0)
+                    .min_size(240.0)
+                    .frame(egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 8, top: 4, bottom: 8 }))
+                    .show(ui, |ui| changes_sidebar(ui, r, actions));
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::same(10)))
+                    .show(ui, |ui| changes_main(ui, r, actions));
+            }
+            _ => {
+                egui::Panel::left(if history_tree { "history_tree" } else { "history_list" })
+                    .resizable(true)
+                    .default_size(if history_tree { 520.0 } else { 360.0 })
+                    .min_size(240.0)
+                    .frame(egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 8, top: 4, bottom: 8 }))
+                    .show(ui, |ui| history_sidebar(ui, r, history_tree, actions));
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::same(10)))
+                    .show(ui, |ui| history_main(ui, r, actions));
+            }
+        }
+    }
 
-                    ui.separator();
-                    let busy = self.busy.is_some();
-                    let remote = r.head.has_remote;
-                    let on_branch = r.head.branch.is_some();
+    fn settings_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        page_frame(ui, |ui| {
+            ui.label(RichText::new("Settings").size(26.0).strong());
+            ui.add_space(14.0);
 
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("Remote").small().weak());
-                        ui.horizontal(|ui| {
-                            let fetch = ui
-                                .add_enabled(remote && !busy, egui::Button::new("⟳ Fetch"))
-                                .on_hover_text("Download new commits and branches from the remote");
-                            if fetch.clicked() {
-                                actions.push(Action::Net(NetOp::Fetch));
-                            }
-
-                            let pull_label = if r.head.behind > 0 {
-                                format!("⬇ Pull ({})", r.head.behind)
-                            } else {
-                                "⬇ Pull".into()
-                            };
-                            let can_pull = remote && !busy && r.head.upstream.is_some();
-                            if ui
-                                .add_enabled(can_pull, egui::Button::new(pull_label))
-                                .on_hover_text("Bring the remote's commits into this branch")
-                                .clicked()
-                            {
-                                actions.push(Action::Net(NetOp::Pull));
-                            }
-
-                            let (push_label, set_upstream) = if r.head.upstream.is_none() {
-                                let remote_name = git::default_remote(&r.repo).unwrap_or_else(|| "origin".into());
-                                let branch = r.head.branch.clone().unwrap_or_default();
-                                ("⬆ Publish branch".to_string(), Some((remote_name, branch)))
-                            } else if r.head.ahead > 0 {
-                                (format!("⬆ Push ({})", r.head.ahead), None)
-                            } else {
-                                ("⬆ Push".to_string(), None)
-                            };
-                            let can_push = remote && !busy && on_branch && !r.head.short_id.is_empty();
-                            if ui
-                                .add_enabled(can_push, egui::Button::new(push_label))
-                                .on_hover_text("Upload your commits to the remote")
-                                .clicked()
-                            {
-                                actions.push(Action::Net(NetOp::Push { set_upstream }));
-                            }
-                        });
-                    });
-                    if !remote {
-                        ui.label(RichText::new("No remote configured").weak().small());
+            theme::card_frame(ui, false).show(ui, |ui| {
+                ui.set_width(460.0);
+                ui.label(RichText::new("Appearance").strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let light = self.settings.light_mode;
+                    if ui.add(egui::Button::selectable(!light, "Dark")).clicked() && light {
+                        actions.push(Action::SetLightMode(false));
                     }
-                }
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let icon = if self.settings.light_mode { "🌙" } else { "☀" };
-                    if ui.button(icon).on_hover_text("Toggle light / dark theme").clicked() {
-                        actions.push(Action::ToggleTheme);
-                    }
-                    if self.repo.is_some()
-                        && ui.button("⟲").on_hover_text("Refresh (F5)").clicked()
-                    {
-                        actions.push(Action::Refresh);
+                    if ui.add(egui::Button::selectable(light, "Light")).clicked() && !light {
+                        actions.push(Action::SetLightMode(true));
                     }
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(12.0);
+
+            theme::card_frame(ui, false).show(ui, |ui| {
+                ui.set_width(460.0);
+                ui.label(RichText::new("Git identity").strong());
+                ui.label(RichText::new("Recorded with every commit. Saved in your global Git config.").small().weak());
+                ui.add_space(6.0);
+                ui.label("Name");
+                ui.add(TextEdit::singleline(&mut self.identity.0).hint_text("Your Name").desired_width(f32::INFINITY));
+                ui.label("Email");
+                ui.add(TextEdit::singleline(&mut self.identity.1).hint_text("you@example.com").desired_width(f32::INFINITY));
+                ui.add_space(6.0);
+                if theme::primary(ui, "Save").clicked() {
+                    actions.push(Action::SetIdentity {
+                        name: self.identity.0.clone(),
+                        email: self.identity.1.clone(),
+                        commit_after: false,
+                    });
+                }
+            });
+            ui.add_space(12.0);
+
+            theme::card_frame(ui, false).show(ui, |ui| {
+                ui.set_width(460.0);
+                ui.label(RichText::new("Git command").strong());
+                if self.git_cli {
+                    ui.label(RichText::new("Found on PATH. Used for clone, fetch, pull and push.").weak());
+                } else {
+                    ui.label(
+                        RichText::new("Not found. Install Git from git-scm.com to clone, fetch, pull and push.")
+                            .color(theme::ORANGE),
+                    );
+                }
+            });
         });
     }
 
@@ -966,91 +1140,6 @@ impl GitsotApp {
                     }
                 });
             });
-        });
-    }
-
-    fn welcome(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space((ui.available_height() * 0.12).max(16.0));
-                ui.heading(RichText::new("Welcome to Gitsot").size(28.0));
-                ui.label(RichText::new("A simple Git client. Pick a repository to get started.").weak());
-                ui.add_space(24.0);
-
-                let size = Vec2::new(280.0, 36.0);
-                if ui.add_sized(size, egui::Button::new("📂  Open a local repository")).clicked() {
-                    actions.push(Action::OpenDialog);
-                }
-                if ui.add_sized(size, egui::Button::new("⬇  Clone a repository from a URL")).clicked() {
-                    actions.push(Action::ShowClone);
-                }
-                if ui.add_sized(size, egui::Button::new("✚  Create a new repository")).clicked() {
-                    actions.push(Action::InitDialog);
-                }
-
-                if !self.settings.recent.is_empty() {
-                    ui.add_space(28.0);
-                    ui.label(RichText::new("Recent repositories").strong());
-                    ui.add_space(4.0);
-                    for p in self.settings.recent.clone() {
-                        ui.horizontal(|ui| {
-                            let w = 360.0_f32.min(ui.available_width());
-                            ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));
-                            let resp = ui.add_sized(
-                                Vec2::new(w - 36.0, 28.0),
-                                egui::Button::new(format!("{}   {}", git::repo_name(&p), p.display())).truncate(),
-                            );
-                            if resp.clicked() {
-                                actions.push(Action::OpenPath(p.clone()));
-                            }
-                            if ui.small_button("✖").on_hover_text("Remove from list").clicked() {
-                                actions.push(Action::ForgetRecent(p.clone()));
-                            }
-                        });
-                    }
-                }
-            });
-        });
-    }
-
-    fn repo_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        let tab = &mut self.tab;
-        let Some(r) = self.repo.as_mut() else { return };
-
-        egui::Panel::left("sidebar")
-            .resizable(true)
-            .default_size(340.0)
-            .min_size(240.0)
-            .show(ui, |ui| {
-                ui.add_space(6.0);
-                ui.columns(2, |cols| {
-                    let label = format!("Changes ({})", r.changes.len());
-                    if cols[0]
-                        .add_sized([cols[0].available_width(), 28.0], egui::Button::selectable(*tab == Tab::Changes, label))
-                        .clicked()
-                    {
-                        *tab = Tab::Changes;
-                    }
-                    if cols[1]
-                        .add_sized([cols[1].available_width(), 28.0], egui::Button::selectable(*tab == Tab::History, "History"))
-                        .clicked()
-                    {
-                        *tab = Tab::History;
-                        if !r.history_loaded {
-                            actions.push(Action::LoadHistory);
-                        }
-                    }
-                });
-                ui.separator();
-                match *tab {
-                    Tab::Changes => changes_sidebar(ui, r, actions),
-                    Tab::History => history_sidebar(ui, r, actions),
-                }
-            });
-
-        egui::CentralPanel::default().show(ui, |ui| match *tab {
-            Tab::Changes => changes_main(ui, r, actions),
-            Tab::History => history_main(ui, r, actions),
         });
     }
 
@@ -1099,7 +1188,7 @@ impl GitsotApp {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         let ok = !url.trim().is_empty() && !name.trim().is_empty() && !busy;
-                        if ui.add_enabled(ok, egui::Button::new("Clone")).clicked() {
+                        if theme::primary_enabled(ui, ok, "Clone").clicked() {
                             actions.push(Action::StartClone {
                                 url: url.clone(),
                                 parent: parent.clone(),
@@ -1121,7 +1210,7 @@ impl GitsotApp {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        if ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Create branch")).clicked()
+                        if theme::primary_enabled(ui, !name.trim().is_empty(), "Create branch").clicked()
                             || (enter && !name.trim().is_empty())
                         {
                             actions.push(Action::CreateBranch(name.clone()));
@@ -1143,7 +1232,7 @@ impl GitsotApp {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         let label = if *commit_after { "Save and commit" } else { "Save" };
-                        if ui.button(label).clicked() {
+                        if theme::primary(ui, label).clicked() {
                             actions.push(Action::SetIdentity {
                                 name: name.clone(),
                                 email: email.clone(),
@@ -1221,7 +1310,7 @@ impl GitsotApp {
                     ui.horizontal(|ui| {
                         let ok = !username.trim().is_empty() && !password.is_empty() && !busy;
                         let enter = pass_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        if ui.add_enabled(ok, egui::Button::new(format!("Sign in and {}", op.verb()))).clicked()
+                        if theme::primary_enabled(ui, ok, format!("Sign in and {}", op.verb())).clicked()
                             || (enter && ok)
                         {
                             actions.push(Action::NetWithCredentials(
@@ -1242,7 +1331,7 @@ impl GitsotApp {
                     });
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("OK").clicked() {
+                        if theme::primary(ui, "OK").clicked() {
                             close = true;
                         }
                         if ui.button("Copy").clicked() {
@@ -1260,6 +1349,143 @@ impl GitsotApp {
             self.dialog = None;
         }
     }
+}
+
+/// Standard padding around a full page.
+fn page_frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .inner_margin(egui::Margin { left: 24, right: 24, top: 18, bottom: 12 })
+        .show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            add(ui)
+        });
+}
+
+fn repo_card(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f32, actions: &mut Vec<Action>) {
+    theme::card_frame(ui, is_current).show(ui, |ui| {
+        ui.with_layout(Layout::top_down(Align::Min), |ui| repo_card_body(ui, card, is_current, width, actions));
+    });
+}
+
+fn repo_card_body(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f32, actions: &mut Vec<Action>) {
+    {
+        ui.set_min_width(width - 28.0);
+        ui.set_max_width(width - 28.0);
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(RichText::new(&card.name).size(16.0).strong()).truncate());
+            if is_current {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new("Current").small().color(theme::BLUE));
+                });
+            }
+        });
+        ui.add(egui::Label::new(RichText::new(card.path.display().to_string()).small().weak()).truncate())
+            .on_hover_text(card.path.display().to_string());
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if card.exists {
+                let branch = card.branch.clone().unwrap_or_default();
+                ui.label(RichText::new(format!("{BRANCH_ICON} {branch}")).small());
+                let host = card.remote.as_deref().map(remote_host).unwrap_or_else(|| "local only".into());
+                ui.add(egui::Label::new(RichText::new(host).small().weak()).truncate());
+            } else {
+                ui.label(RichText::new("Folder not found").small().color(theme::RED));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("Remove").on_hover_text("Remove from this list (files are kept)").clicked() {
+                    actions.push(Action::ForgetRecent(card.path.clone()));
+                }
+            });
+        });
+        ui.add_space(6.0);
+        let label = if is_current { "Go to changes" } else { "Open" };
+        if theme::primary_wide(ui, card.exists, label, 30.0).clicked() {
+            actions.push(if is_current { Action::GoTo(Page::Changes) } else { Action::OpenPath(card.path.clone()) });
+        }
+    }
+}
+
+/// `https://gitlab.com/a/b.git` -> `gitlab.com`, `git@host:a/b` -> `host`.
+fn remote_host(url: &str) -> String {
+    if url.starts_with('/') || url.starts_with('.') || url.contains(":\\") || url.starts_with("file://") {
+        "local remote".into()
+    } else if cli::is_http_url(url) || url.contains("://") {
+        cli::host_of(url)
+    } else {
+        url.split('@').next_back().unwrap_or(url).split(':').next().unwrap_or(url).to_string()
+    }
+}
+
+fn remote_buttons(ui: &mut egui::Ui, r: &RepoView, busy: bool, actions: &mut Vec<Action>) {
+    let remote = r.head.has_remote;
+    let on_branch = r.head.branch.is_some();
+    // Laid out right-to-left: Push, Pull, Fetch.
+    let (push_label, set_upstream) = if r.head.upstream.is_none() {
+        let remote_name = git::default_remote(&r.repo).unwrap_or_else(|| "origin".into());
+        let branch = r.head.branch.clone().unwrap_or_default();
+        ("⬆ Publish branch".to_string(), Some((remote_name, branch)))
+    } else if r.head.ahead > 0 {
+        (format!("⬆ Push ({})", r.head.ahead), None)
+    } else {
+        ("⬆ Push".to_string(), None)
+    };
+    let can_push = remote && !busy && on_branch && !r.head.short_id.is_empty();
+    if theme::primary_enabled(ui, can_push, push_label)
+        .on_hover_text("Upload your commits to the remote")
+        .clicked()
+    {
+        actions.push(Action::Net(NetOp::Push { set_upstream }));
+    }
+    let pull_label = if r.head.behind > 0 { format!("⬇ Pull ({})", r.head.behind) } else { "⬇ Pull".into() };
+    let can_pull = remote && !busy && r.head.upstream.is_some();
+    if theme::primary_enabled(ui, can_pull, pull_label)
+        .on_hover_text("Bring the remote's commits into this branch")
+        .clicked()
+    {
+        actions.push(Action::Net(NetOp::Pull));
+    }
+    if theme::primary_enabled(ui, remote && !busy, "⟳ Fetch")
+        .on_hover_text("Download new commits and branches from the remote")
+        .clicked()
+    {
+        actions.push(Action::Net(NetOp::Fetch));
+    }
+    if !remote {
+        ui.label(RichText::new("No remote").small().weak());
+    }
+}
+
+/// List / Tree switch for the history page.
+fn segmented(ui: &mut egui::Ui, tree: bool, actions: &mut Vec<Action>) {
+    // Right-to-left layout: add "Tree" first so it ends up on the right.
+    ui.spacing_mut().item_spacing.x = 2.0;
+    for (label, value) in [("Tree", true), ("List", false)] {
+        let selected = tree == value;
+        let resp = if selected {
+            theme::primary(ui, label)
+        } else {
+            ui.button(label)
+        };
+        if resp.clicked() && !selected {
+            actions.push(Action::SetHistoryTree(value));
+        }
+    }
+    ui.spacing_mut().item_spacing.x = 8.0;
+}
+
+fn about_page(ui: &mut egui::Ui) {
+    page_frame(ui, |ui| {
+        ui.add_space(30.0);
+        ui.vertical_centered(|ui| {
+            theme::logo(ui, 72.0);
+            ui.add_space(10.0);
+            ui.label(RichText::new("gitsot").size(30.0).strong());
+            ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).weak());
+            ui.add_space(10.0);
+            ui.label("A simple, friendly Git client for any Git host.");
+            ui.label(RichText::new("Built with Rust, egui and libgit2. Works on Windows and macOS.").weak());
+        });
+    });
 }
 
 fn branch_menu(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
@@ -1346,12 +1572,7 @@ fn changes_sidebar(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action
         let can_commit = staged > 0 && !r.summary.trim().is_empty();
         let shortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
         let pressed = ui.input_mut(|i| i.consume_shortcut(&shortcut));
-        let btn = ui
-            .add_enabled(
-                can_commit,
-                egui::Button::new(RichText::new(format!("Commit to {branch}")).strong())
-                    .min_size(Vec2::new(ui.available_width(), 32.0)),
-            )
+        let btn = theme::primary_wide(ui, can_commit, format!("Commit to {branch}"), 32.0)
             .on_hover_text(format!("{} ({})", "Commit staged files", ui.ctx().format_shortcut(&shortcut)));
         if btn.clicked() || (pressed && can_commit) {
             actions.push(Action::Commit);
@@ -1468,7 +1689,7 @@ fn changes_main(ui: &mut egui::Ui, r: &mut RepoView, _actions: &mut Vec<Action>)
     }
 }
 
-fn history_sidebar(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
+fn history_sidebar(ui: &mut egui::Ui, r: &mut RepoView, tree: bool, actions: &mut Vec<Action>) {
     if r.history.is_empty() {
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
@@ -1476,34 +1697,68 @@ fn history_sidebar(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action
         });
         return;
     }
-    let row_h = 46.0;
+    let tree = tree && r.graph.rows.len() == r.history.len();
+    let row_h = if tree { 30.0 } else { 46.0 };
+    const LANE_W: f32 = 16.0;
+    let lanes_shown = r.graph.width.min(24);
+    let graph_w = if tree { lanes_shown as f32 * LANE_W + 10.0 } else { 0.0 };
+
+    ui.spacing_mut().item_spacing.y = 0.0;
     egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, r.history.len(), |ui, range| {
-        for c in &r.history[range] {
+        for i in range {
+            let c = &r.history[i];
             let selected = r.selected_commit == Some(c.id);
             let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click());
-            let visuals = ui.visuals();
+            let visuals = ui.visuals().clone();
             if selected {
-                ui.painter().rect_filled(rect, 4.0, visuals.selection.bg_fill);
+                ui.painter().rect_filled(rect, 4.0, visuals.selection.bg_fill.gamma_multiply(if tree { 0.35 } else { 1.0 }));
             } else if resp.hovered() {
                 ui.painter().rect_filled(rect, 4.0, visuals.widgets.hovered.weak_bg_fill);
             }
-            let text_color = if selected { visuals.selection.stroke.color } else { visuals.strong_text_color() };
-            let weak = if selected { visuals.selection.stroke.color } else { visuals.weak_text_color() };
-            let painter = ui.painter().with_clip_rect(rect.shrink(2.0));
-            painter.text(
-                rect.left_top() + Vec2::new(8.0, 6.0),
-                Align2::LEFT_TOP,
-                &c.summary,
-                FontId::proportional(14.0),
-                text_color,
-            );
-            painter.text(
-                rect.left_top() + Vec2::new(8.0, 26.0),
-                Align2::LEFT_TOP,
-                format!("{} · {}", c.author, relative_time(c.time)),
-                FontId::proportional(12.0),
-                weak,
-            );
+            let on_blue = selected && !tree;
+            let text_color = if on_blue { Color32::WHITE } else { visuals.strong_text_color() };
+            let weak = if on_blue { Color32::WHITE } else { visuals.weak_text_color() };
+            let painter = ui.painter().with_clip_rect(rect);
+
+            if tree {
+                paint_graph_row(&painter, rect, &r.graph.rows[i], LANE_W, lanes_shown, visuals.panel_fill);
+                let mut x = rect.left() + graph_w;
+                let y = rect.center().y;
+                if let Some(labels) = r.labels.get(&c.id) {
+                    let color = theme::lane_color(r.graph.rows[i].color);
+                    for l in labels.iter().take(4) {
+                        x = paint_ref_pill(&painter, Pos2::new(x, y), l, color, text_color) + 6.0;
+                    }
+                }
+                let galley = painter.layout_no_wrap(c.summary.clone(), FontId::proportional(13.5), text_color);
+                let w = galley.size().x;
+                painter.galley(Pos2::new(x, y - galley.size().y / 2.0), galley, text_color);
+                painter.text(
+                    Pos2::new(x + w + 10.0, y),
+                    Align2::LEFT_CENTER,
+                    format!("{} · {}", c.author, relative_time(c.time)),
+                    FontId::proportional(12.0),
+                    weak,
+                );
+            } else {
+                let painter = painter.with_clip_rect(rect.shrink(2.0));
+                painter.text(
+                    rect.left_top() + Vec2::new(8.0, 6.0),
+                    Align2::LEFT_TOP,
+                    &c.summary,
+                    FontId::proportional(14.0),
+                    text_color,
+                );
+                let mut meta = format!("{} · {}", c.author, relative_time(c.time));
+                if let Some(labels) = r.labels.get(&c.id) {
+                    let names: Vec<&str> = labels.iter().filter(|l| l.kind != RefKind::Remote).map(|l| l.name.as_str()).collect();
+                    if !names.is_empty() {
+                        meta = format!("{}  ·  {meta}", names.join(", "));
+                    }
+                }
+                painter.text(rect.left_top() + Vec2::new(8.0, 26.0), Align2::LEFT_TOP, meta, FontId::proportional(12.0), weak);
+            }
+
             if resp.clicked() && !selected {
                 actions.push(Action::SelectCommit(c.id));
             }
@@ -1515,6 +1770,62 @@ fn history_sidebar(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action
             });
         }
     });
+}
+
+/// Paint one row of the branch graph: straight lanes, curves into and out of the dot, the dot.
+fn paint_graph_row(painter: &egui::Painter, rect: egui::Rect, row: &graph::GraphRow, lane_w: f32, max_lanes: usize, bg: Color32) {
+    let x = |col: usize| rect.left() + 8.0 + col.min(max_lanes.saturating_sub(1)) as f32 * lane_w;
+    let (top, mid, bottom) = (rect.top(), rect.center().y, rect.bottom());
+    let width = 2.0;
+    let curve = |a: Pos2, b: Pos2, c: Pos2, d: Pos2, color: Color32| {
+        painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+            [a, b, c, d],
+            false,
+            Color32::TRANSPARENT,
+            Stroke::new(width, color),
+        ));
+    };
+    for s in &row.pass {
+        painter.line_segment([Pos2::new(x(s.from_col), top), Pos2::new(x(s.from_col), bottom)], Stroke::new(width, theme::lane_color(s.color)));
+    }
+    let node = Pos2::new(x(row.col), mid);
+    for s in &row.incoming {
+        let color = theme::lane_color(s.color);
+        let from = Pos2::new(x(s.from_col), top);
+        if s.from_col == row.col {
+            painter.line_segment([from, node], Stroke::new(width, color));
+        } else {
+            curve(from, Pos2::new(from.x, mid), Pos2::new(from.x, mid), node, color);
+        }
+    }
+    for s in &row.outgoing {
+        let color = theme::lane_color(s.color);
+        let to = Pos2::new(x(s.to_col), bottom);
+        if s.to_col == row.col {
+            painter.line_segment([node, to], Stroke::new(width, color));
+        } else {
+            curve(node, Pos2::new(to.x, mid), Pos2::new(to.x, mid), to, color);
+        }
+    }
+    let color = theme::lane_color(row.color);
+    painter.circle(node, 5.0, color, Stroke::new(1.5, bg));
+}
+
+/// Draw a branch/tag label like `⎇ main` or `🌐 origin/main`; returns the right edge.
+fn paint_ref_pill(painter: &egui::Painter, left_center: Pos2, label: &RefLabel, color: Color32, text_color: Color32) -> f32 {
+    let icon: &str = match label.kind {
+        RefKind::Local => BRANCH_ICON,
+        RefKind::Remote => "🌐",
+        RefKind::Tag => "🏷",
+    };
+    let text = if label.is_head { format!("✔ {icon} {}", label.name) } else { format!("{icon} {}", label.name) };
+    let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), text_color);
+    let size = galley.size() + Vec2::new(12.0, 6.0);
+    let rect = egui::Rect::from_min_size(Pos2::new(left_center.x, left_center.y - size.y / 2.0), size);
+    let fill = if label.kind == RefKind::Remote { Color32::TRANSPARENT } else { color.gamma_multiply(0.18) };
+    painter.rect(rect, 4.0, fill, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+    painter.galley(rect.min + Vec2::new(6.0, 3.0), galley, text_color);
+    rect.right()
 }
 
 fn history_main(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
