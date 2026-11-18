@@ -6,7 +6,7 @@ Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](ht
 
 ## Features
 
-- **Repositories**: your repositories as cards showing the branch, host and the **name/email that commits will use**. Put cards into **groups** (card menu ☰ → *Move to group…*). Open a local folder, clone from a URL, or create a new one.
+- **Repositories**: your repositories as cards showing the branch, host and the **name/email that commits will use**. Organise them into **groups**: click *+ Group*, then drag cards onto a group (or use the card menu ☰ → *Move to group…*). Rename or delete a group from the ☰ next to its name. Open a local folder, clone from a URL, or create a new one.
 - **Changes**: see every changed file, tick the ones to include (stage), untick to unstage, and view a coloured diff.
 - **Commit**: summary + description, then *Commit to &lt;branch&gt;* (or <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>Enter</kbd>). If your Git name/email are not set, Gitsot asks for them once.
 - **Discard**: right-click a file (or *Discard all…*) to throw away changes, with a confirmation.
