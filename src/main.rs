@@ -5,6 +5,7 @@ mod app;
 mod cli;
 mod git;
 mod graph;
+mod identity;
 mod theme;
 
 fn main() -> eframe::Result {

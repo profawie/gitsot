@@ -436,40 +436,6 @@ pub fn signature(repo: &Repository) -> Result<Signature<'static>> {
         .map_err(|_| anyhow!("Your Git name and email are not set"))
 }
 
-pub fn identity(repo: Option<&Repository>) -> (String, String) {
-    let cfg = match repo {
-        Some(r) => r.config(),
-        None => git2::Config::open_default(),
-    };
-    match cfg {
-        Ok(cfg) => (
-            cfg.get_string("user.name").unwrap_or_default(),
-            cfg.get_string("user.email").unwrap_or_default(),
-        ),
-        Err(_) => Default::default(),
-    }
-}
-
-pub fn set_global_identity(name: &str, email: &str) -> Result<()> {
-    let path = match git2::Config::find_global() {
-        Ok(p) => p,
-        Err(_) => {
-            let home = std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .ok_or_else(|| anyhow!("Could not find your home folder"))?;
-            let p = PathBuf::from(home).join(".gitconfig");
-            if !p.exists() {
-                std::fs::write(&p, "")?;
-            }
-            p
-        }
-    };
-    let mut cfg = git2::Config::open(&path)?;
-    cfg.set_str("user.name", name.trim())?;
-    cfg.set_str("user.email", email.trim())?;
-    Ok(())
-}
-
 pub fn commit(repo: &Repository, message: &str) -> Result<Oid> {
     let sig = signature(repo)?;
     let mut index = repo.index()?;
