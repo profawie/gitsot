@@ -39,6 +39,8 @@ struct Settings {
     history_view_tree: bool,
     /// Group name for each repository on the Repositories page.
     groups: HashMap<PathBuf, String>,
+    /// Groups created with "New group" (they stay even when empty).
+    group_names: Vec<String>,
 }
 
 impl Default for Settings {
@@ -50,11 +52,20 @@ impl Default for Settings {
             light_mode: false,
             history_view_tree: true,
             groups: HashMap::new(),
+            group_names: Vec::new(),
         }
     }
 }
 
 impl Settings {
+    /// Every group name, A–Z.
+    fn all_groups(&self) -> Vec<String> {
+        let mut all: Vec<String> = self.group_names.iter().chain(self.groups.values()).cloned().collect();
+        all.sort_by_key(|g| g.to_lowercase());
+        all.dedup();
+        all
+    }
+
     fn remember(&mut self, path: &Path) {
         self.recent.retain(|p| p != path);
         self.recent.insert(0, path.to_path_buf());
@@ -271,6 +282,8 @@ enum Dialog {
     /// About to commit or push with an identity that doesn't match the folder rule.
     IdentityWarning { push: Option<NetOp>, rule: FolderRule, effective: Identity, bad_commits: Vec<(String, String)> },
     SetGroup { path: PathBuf, name: String },
+    /// Create a group, or rename `rename` when set.
+    GroupName { name: String, rename: Option<String> },
 }
 
 /// Things the user asked for while drawing the UI; applied afterwards so we
@@ -319,6 +332,9 @@ enum Action {
     PushIgnoringIdentity(NetOp),
     AskGroup(PathBuf),
     SetGroup(PathBuf, String),
+    AskGroupName(Option<String>),
+    SaveGroupName { name: String, rename: Option<String> },
+    DeleteGroup(String),
 }
 
 struct Toast {
@@ -637,6 +653,31 @@ impl GitsotApp {
                 } else {
                     self.settings.groups.insert(path, name);
                 }
+            }
+            Action::AskGroupName(rename) => {
+                let name = rename.clone().unwrap_or_default();
+                self.dialog = Some(Dialog::GroupName { name, rename });
+            }
+            Action::SaveGroupName { name, rename } => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                self.dialog = None;
+                if let Some(old) = rename {
+                    for g in self.settings.groups.values_mut().filter(|g| **g == old) {
+                        *g = name.clone();
+                    }
+                    self.settings.group_names.retain(|g| *g != old);
+                }
+                if !self.settings.group_names.contains(&name) {
+                    self.settings.group_names.push(name);
+                }
+            }
+            Action::DeleteGroup(name) => {
+                self.settings.groups.retain(|_, g| *g != name);
+                self.settings.group_names.retain(|g| *g != name);
+                self.info(format!("Deleted group {name}. Its repositories are now ungrouped."));
             }
             other => {
                 let Some(r) = self.repo.as_mut() else { return };
@@ -1111,6 +1152,9 @@ impl GitsotApp {
                     if theme::primary(ui, "Open folder").on_hover_text("Open a repository on this computer (Ctrl+O)").clicked() {
                         actions.push(Action::OpenDialog);
                     }
+                    if theme::primary(ui, "+ Group").on_hover_text("Create a group, then drag repository cards into it").clicked() {
+                        actions.push(Action::AskGroupName(None));
+                    }
                     ui.add(TextEdit::singleline(&mut self.repo_filter).hint_text("Search repositories").desired_width(200.0));
                 });
             });
@@ -1139,31 +1183,84 @@ impl GitsotApp {
             let gap = 14.0;
             let per_row = (((ui.available_width() + gap) / (card_w + gap)).floor() as usize).max(1);
 
-            // Group the cards; named groups A–Z first, then "Ungrouped".
-            let mut groups: Vec<(String, Vec<&RepoCard>)> = Vec::new();
+            // Named groups A–Z (empty ones too, unless searching), then "Ungrouped".
+            let mut groups: Vec<(String, Vec<&RepoCard>)> = self
+                .settings
+                .all_groups()
+                .into_iter()
+                .map(|g| (g, Vec::new()))
+                .chain(std::iter::once((String::new(), Vec::new())))
+                .collect();
             for card in cards {
                 let g = self.settings.groups.get(&card.path).cloned().unwrap_or_default();
-                match groups.iter_mut().find(|(name, _)| *name == g) {
-                    Some((_, list)) => list.push(card),
-                    None => groups.push((g, vec![card])),
+                if let Some((_, list)) = groups.iter_mut().find(|(name, _)| *name == g) {
+                    list.push(card);
                 }
             }
-            groups.sort_by_key(|(name, _)| (name.is_empty(), name.to_lowercase()));
+            let has_named = groups.iter().any(|(g, _)| !g.is_empty());
+            groups.retain(|(g, list)| !list.is_empty() || (filter.is_empty() && (!g.is_empty() || has_named)));
 
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                let dragging = egui::DragAndDrop::has_payload_of_type::<CardDrag>(ui.ctx());
                 for (group, list) in &groups {
-                    let title = if group.is_empty() { "Ungrouped" } else { group.as_str() };
-                    ui.label(RichText::new(format!("{title}  ({})", list.len())).strong().weak());
-                    ui.add_space(6.0);
-                    for chunk in list.chunks(per_row) {
-                        ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = gap;
-                            for card in chunk {
-                                let is_current = current.as_ref() == Some(&card.path);
-                                repo_card(ui, card, is_current, card_w, actions);
+                    let section = ui.scope(|ui| {
+                        ui.horizontal(|ui| {
+                            let title = if group.is_empty() { "Ungrouped" } else { group.as_str() };
+                            ui.label(RichText::new(format!("{title}  ({})", list.len())).strong().weak());
+                            if !group.is_empty() {
+                                ui.menu_button(RichText::new("☰").small(), |ui| {
+                                    if ui.button("Rename group…").clicked() {
+                                        actions.push(Action::AskGroupName(Some(group.clone())));
+                                        ui.close();
+                                    }
+                                    if ui.button("Delete group").on_hover_text("Its repositories become ungrouped").clicked() {
+                                        actions.push(Action::DeleteGroup(group.clone()));
+                                        ui.close();
+                                    }
+                                });
                             }
                         });
-                        ui.add_space(gap);
+                        ui.add_space(6.0);
+                        if list.is_empty() {
+                            let (rect, _) = ui.allocate_exact_size(Vec2::new(card_w, 56.0), Sense::hover());
+                            ui.painter().rect_stroke(
+                                rect,
+                                10.0,
+                                Stroke::new(1.0, ui.visuals().weak_text_color()),
+                                egui::StrokeKind::Inside,
+                            );
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Drag repositories here",
+                                egui::FontId::proportional(13.0),
+                                ui.visuals().weak_text_color(),
+                            );
+                            ui.add_space(gap);
+                        }
+                        for chunk in list.chunks(per_row) {
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                for card in chunk {
+                                    let is_current = current.as_ref() == Some(&card.path);
+                                    let id = egui::Id::unique(("card-drag", &card.path));
+                                    ui.dnd_drag_source(id, CardDrag(card.path.clone()), |ui| {
+                                        repo_card(ui, card, is_current, card_w, actions);
+                                    });
+                                }
+                            });
+                            ui.add_space(gap);
+                        }
+                    });
+                    let zone = section.response;
+                    // Highlight the group under the pointer while a card is dragged.
+                    if dragging && zone.contains_pointer() {
+                        let rect = zone.rect.expand(6.0);
+                        ui.painter().rect_filled(rect, 12.0, theme::BLUE.gamma_multiply(0.08));
+                        ui.painter().rect_stroke(rect, 12.0, Stroke::new(1.5, theme::BLUE), egui::StrokeKind::Inside);
+                    }
+                    if let Some(drop) = zone.dnd_release_payload::<CardDrag>() {
+                        actions.push(Action::SetGroup(drop.0.clone(), group.clone()));
                     }
                     ui.add_space(8.0);
                 }
@@ -1513,7 +1610,7 @@ impl GitsotApp {
                     ui.label(RichText::new("The new branch starts from your current commit and you will switch to it.").small().weak());
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        let enter = ui.input(|i| i.key_pressed(Key::Enter));
                         if theme::primary_enabled(ui, !name.trim().is_empty(), "Create branch").clicked()
                             || (enter && !name.trim().is_empty())
                         {
@@ -1678,9 +1775,7 @@ impl GitsotApp {
                     ui.add_space(6.0);
                     let resp = ui.add(TextEdit::singleline(name).hint_text("Group name, e.g. Company").desired_width(f32::INFINITY));
                     resp.request_focus();
-                    let mut existing: Vec<String> = self.settings.groups.values().cloned().collect();
-                    existing.sort();
-                    existing.dedup();
+                    let existing = self.settings.all_groups();
                     if !existing.is_empty() {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("Existing:").small().weak());
@@ -1694,9 +1789,27 @@ impl GitsotApp {
                     ui.label(RichText::new("Leave empty to remove it from its group.").small().weak());
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        let enter = ui.input(|i| i.key_pressed(Key::Enter));
                         if theme::primary(ui, "Save").clicked() || enter {
                             actions.push(Action::SetGroup(path.clone(), name.clone()));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::GroupName { name, rename } => {
+                    ui.heading(if rename.is_some() { "Rename group" } else { "New group" });
+                    ui.add_space(6.0);
+                    let resp = ui.add(TextEdit::singleline(name).hint_text("Group name, e.g. Company").desired_width(320.0));
+                    resp.request_focus();
+                    ui.label(RichText::new("Drag repository cards onto a group to move them.").small().weak());
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let enter = ui.input(|i| i.key_pressed(Key::Enter));
+                        let label = if rename.is_some() { "Rename" } else { "Create group" };
+                        if (theme::primary_enabled(ui, !name.trim().is_empty(), label).clicked() || enter) && !name.trim().is_empty() {
+                            actions.push(Action::SaveGroupName { name: name.clone(), rename: rename.clone() });
                         }
                         if ui.button("Cancel").clicked() {
                             close = true;
@@ -1741,8 +1854,12 @@ fn page_frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
+/// Drag-and-drop payload: the repository card being moved.
+struct CardDrag(PathBuf);
+
 fn repo_card(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f32, actions: &mut Vec<Action>) {
     theme::card_frame(ui, is_current).show(ui, |ui| {
+        ui.style_mut().interaction.selectable_labels = false;
         ui.with_layout(Layout::top_down(Align::Min), |ui| repo_card_body(ui, card, is_current, width, actions));
     });
 }
