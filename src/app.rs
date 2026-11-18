@@ -1202,6 +1202,7 @@ impl GitsotApp {
 
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 let dragging = egui::DragAndDrop::has_payload_of_type::<CardDrag>(ui.ctx());
+                let mut over_group: Option<String> = None;
                 for (group, list) in &groups {
                     let section = ui.scope(|ui| {
                         ui.horizontal(|ui| {
@@ -1244,9 +1245,11 @@ impl GitsotApp {
                                 for card in chunk {
                                     let is_current = current.as_ref() == Some(&card.path);
                                     let id = egui::Id::unique(("card-drag", &card.path));
-                                    ui.dnd_drag_source(id, CardDrag(card.path.clone()), |ui| {
-                                        repo_card(ui, card, is_current, card_w, actions);
-                                    });
+                                    if drag_area(ui, id) {
+                                        egui::DragAndDrop::set_payload(ui.ctx(), CardDrag(card.path.clone(), card.name.clone()));
+                                    }
+                                    let rect = repo_card(ui, card, is_current, card_w, actions);
+                                    drag_area_drawn(ui, id, rect);
                                 }
                             });
                             ui.add_space(gap);
@@ -1255,6 +1258,7 @@ impl GitsotApp {
                     let zone = section.response;
                     // Highlight the group under the pointer while a card is dragged.
                     if dragging && zone.contains_pointer() {
+                        over_group = Some(group.clone());
                         let rect = zone.rect.expand(6.0);
                         ui.painter().rect_filled(rect, 12.0, theme::BLUE.gamma_multiply(0.08));
                         ui.painter().rect_stroke(rect, 12.0, Stroke::new(1.5, theme::BLUE), egui::StrokeKind::Inside);
@@ -1263,6 +1267,9 @@ impl GitsotApp {
                         actions.push(Action::SetGroup(drop.0.clone(), group.clone()));
                     }
                     ui.add_space(8.0);
+                }
+                if let Some(drag) = egui::DragAndDrop::payload::<CardDrag>(ui.ctx()) {
+                    drag_chip(ui.ctx(), &drag.1, over_group.as_deref());
                 }
             });
         });
@@ -1855,13 +1862,58 @@ fn page_frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// Drag-and-drop payload: the repository card being moved.
-struct CardDrag(PathBuf);
+struct CardDrag(PathBuf, String);
 
-fn repo_card(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f32, actions: &mut Vec<Action>) {
+/// Makes an area draggable without taking clicks away from the buttons drawn
+/// in it. Call before drawing the area, then [`drag_area_drawn`] with the space
+/// it took. The drag is registered *before* the content so the buttons end up
+/// on top of it; where the content was is remembered from the last frame.
+/// Returns `true` in the frame a drag starts.
+fn drag_area(ui: &mut egui::Ui, id: egui::Id) -> bool {
+    let Some(rect) = ui.data(|d| d.get_temp::<egui::Rect>(id)) else { return false };
+    ui.interact(rect, id, Sense::drag()).drag_started()
+}
+
+fn drag_area_drawn(ui: &egui::Ui, id: egui::Id, rect: egui::Rect) {
+    ui.data_mut(|d| d.insert_temp(id, rect));
+}
+
+/// While a card is dragged: its name in a small box next to the pointer.
+fn drag_chip(ctx: &egui::Context, name: &str, over_group: Option<&str>) {
+    let Some(pointer) = ctx.pointer_latest_pos() else { return };
+    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+    egui::Area::new(egui::Id::unique("gitsot-drag-chip"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(pointer + Vec2::new(14.0, 14.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            let dark = ui.visuals().dark_mode;
+            egui::Frame::new()
+                .fill(theme::card_bg(dark))
+                .stroke(Stroke::new(1.0, theme::BLUE))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.add(egui::Label::new(RichText::new(name).strong()).extend());
+                    let hint = match over_group {
+                        Some("") => "Drop to ungroup".to_string(),
+                        Some(g) => format!("Drop to move to {g}"),
+                        None => "Drop on a group".to_string(),
+                    };
+                    ui.add(egui::Label::new(RichText::new(hint).small().color(theme::BLUE_HOVER)).extend());
+                });
+        });
+}
+
+/// Draws a repository card and returns the space it took.
+fn repo_card(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f32, actions: &mut Vec<Action>) -> egui::Rect {
     theme::card_frame(ui, is_current).show(ui, |ui| {
         ui.style_mut().interaction.selectable_labels = false;
         ui.with_layout(Layout::top_down(Align::Min), |ui| repo_card_body(ui, card, is_current, width, actions));
-    });
+    })
+    .response
+    .rect
 }
 
 fn repo_card_body(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f32, actions: &mut Vec<Action>) {
