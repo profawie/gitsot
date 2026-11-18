@@ -176,7 +176,29 @@ fn path_key(p: &Path) -> String {
 /// Does `folder` (a rule folder) contain `repo_path`?
 pub fn folder_contains(folder: &str, repo_path: &Path) -> bool {
     let f = path_key(Path::new(folder));
-    path_key(repo_path).starts_with(&f)
+    path_key(repo_path).starts_with(&f) || real_path(repo_path).is_some_and(|p| path_key(&p).starts_with(&f))
+}
+
+/// The path with symlinks resolved (for example macOS `/var` → `/private/var`),
+/// because `git` matches `includeIf "gitdir:…"` against the real path. Not used on
+/// Windows, where resolving can turn mapped drives into UNC paths.
+fn real_path(p: &Path) -> Option<std::path::PathBuf> {
+    if cfg!(windows) {
+        return None;
+    }
+    // Resolve the deepest part that exists, so a folder that doesn't exist yet
+    // still gets the same prefix it will have once it is created.
+    let mut base = p;
+    let mut rest = Vec::new();
+    let real = loop {
+        if let Ok(r) = std::fs::canonicalize(base) {
+            break r;
+        }
+        rest.push(base.file_name()?);
+        base = base.parent()?;
+    };
+    let full = rest.iter().rev().fold(real, |acc, part| acc.join(part));
+    (full != p).then_some(full)
 }
 
 /// The folder rules Gitsot manages, read from the global git config.
@@ -225,7 +247,10 @@ fn add_rule_in(global: &Path, dir: &Path, folder: &Path, id: &Identity) -> Resul
     if folder_s.trim().is_empty() {
         bail!("Please choose a folder");
     }
-    let folder = normalize_folder(&folder_s);
+    let folder = match real_path(folder) {
+        Some(real) => normalize_folder(&real.to_string_lossy()),
+        None => normalize_folder(&folder_s),
+    };
     std::fs::create_dir_all(dir).with_context(|| format!("Could not create {}", dir.display()))?;
 
     // A readable, unique file name from the folder.
@@ -386,6 +411,7 @@ mod include_if_tests {
         std::fs::write(&global, "[user]\n\tname = Me\n\temail = me@personal.dev\n").unwrap();
         let company = tmp.join("company");
         let id = Identity { name: "Me Work".into(), email: "me@company.com".into() };
+        std::fs::create_dir_all(&company).unwrap();
         add_rule_in(&global, &tmp.join("ids"), &company, &id).unwrap();
 
         let repo_path = company.join("app");
