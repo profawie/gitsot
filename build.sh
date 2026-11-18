@@ -7,7 +7,7 @@
 #                         (needs mingw-w64, e.g. `brew install mingw-w64`
 #                          or `apt install gcc-mingw-w64-x86-64`)
 #
-# Output goes to ./dist. On macOS a Gitsot.app bundle is created as well.
+# Output goes to ./dist. On macOS a gitsot.app bundle is created as well.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -55,7 +55,7 @@ cargo build "${CARGO_FLAGS[@]}"
 cp "target/$PROFILE/gitsot" dist/gitsot
 
 if [ "$(uname -s)" = "Darwin" ]; then
-  APP=dist/Gitsot.app
+  APP=dist/gitsot.app
   VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
   rm -rf "$APP"
   mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -65,8 +65,8 @@ if [ "$(uname -s)" = "Darwin" ]; then
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Gitsot</string>
-  <key>CFBundleDisplayName</key><string>Gitsot</string>
+  <key>CFBundleName</key><string>gitsot</string>
+  <key>CFBundleDisplayName</key><string>gitsot</string>
   <key>CFBundleIdentifier</key><string>com.gitsot.app</string>
   <key>CFBundleVersion</key><string>${VERSION}</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
