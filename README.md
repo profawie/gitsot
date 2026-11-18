@@ -15,7 +15,9 @@ Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](ht
 - **History**: browse commits, see the files each one changed and their diffs.
 - Light and dark theme, auto-refresh when the window regains focus, <kbd>F5</kbd> to refresh.
 
-Clone, fetch, pull and push use the `git` command installed on your computer, so your existing sign-in setup (Git Credential Manager, macOS keychain, SSH keys) just works. Everything else is done in-process with libgit2.
+Gitsot works with any Git host (GitHub, GitLab, Bitbucket, Gitea, self-hosted servers, …). It never uses `gh` or any host-specific tool.
+
+Clone, fetch, pull and push use the `git` command installed on your computer, so saved credentials and SSH keys keep working. Credential helpers are never allowed to open their own sign-in windows (such as Git Credential Manager's GitHub page). When an HTTPS remote needs a password and nothing is saved, Gitsot shows one plain *Sign in* dialog (username + password or access token), and your credential store remembers it if one is configured. Everything else is done in-process with libgit2.
 
 ## Requirements
 
