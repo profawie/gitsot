@@ -41,6 +41,8 @@ struct Settings {
     groups: HashMap<PathBuf, String>,
     /// Groups created with "New group" (they stay even when empty).
     group_names: Vec<String>,
+    /// Groups folded shut on the Repositories page.
+    collapsed_groups: Vec<String>,
 }
 
 impl Default for Settings {
@@ -53,6 +55,7 @@ impl Default for Settings {
             history_view_tree: true,
             groups: HashMap::new(),
             group_names: Vec::new(),
+            collapsed_groups: Vec::new(),
         }
     }
 }
@@ -333,6 +336,7 @@ enum Action {
     AskGroup(PathBuf),
     SetGroup(PathBuf, String),
     AskGroupName(Option<String>),
+    ToggleGroup(String),
     SaveGroupName { name: String, rename: Option<String> },
     DeleteGroup(String),
 }
@@ -652,6 +656,13 @@ impl GitsotApp {
                     self.settings.groups.remove(&path);
                 } else {
                     self.settings.groups.insert(path, name);
+                }
+            }
+            Action::ToggleGroup(name) => {
+                if let Some(i) = self.settings.collapsed_groups.iter().position(|g| *g == name) {
+                    self.settings.collapsed_groups.remove(i);
+                } else {
+                    self.settings.collapsed_groups.push(name);
                 }
             }
             Action::AskGroupName(rename) => {
@@ -1088,21 +1099,18 @@ impl eframe::App for GitsotApp {
 
 impl GitsotApp {
     fn nav_sidebar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        let dark = ui.visuals().dark_mode;
+        let p = theme::pal(ui);
         egui::Panel::left("nav")
             .resizable(false)
-            .exact_size(200.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::nav_bg(dark))
-                    .inner_margin(egui::Margin { left: 12, right: 12, top: 16, bottom: 10 }),
-            )
+            .exact_size(196.0)
+            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::same(12)))
             .show(ui, |ui| {
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    theme::logo(ui, 26.0);
-                    ui.label(RichText::new("gitsot").size(20.0).strong());
+                    theme::logo(ui, 22.0);
+                    ui.label(RichText::new("gitsot").size(18.0).strong());
                 });
-                ui.add_space(18.0);
+                ui.add_space(14.0);
 
                 let page = self.page;
                 if theme::nav_item(ui, page == Page::Repositories, "Repositories", None).clicked() {
@@ -1113,7 +1121,6 @@ impl GitsotApp {
                     ui.add_space(14.0);
                     ui.add(egui::Label::new(RichText::new(r.name().to_uppercase()).small().weak()).truncate())
                         .on_hover_text(r.path.display().to_string());
-                    ui.add_space(2.0);
                     if theme::nav_item(ui, page == Page::Changes, "Changes", Some(r.changes.len())).clicked() {
                         actions.push(Action::GoTo(Page::Changes));
                     }
@@ -1123,6 +1130,7 @@ impl GitsotApp {
                 }
 
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                    ui.add_space(4.0);
                     ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).small().weak());
                     ui.add_space(4.0);
                     if theme::nav_item(ui, page == Page::About, "About", None).clicked() {
@@ -1139,8 +1147,7 @@ impl GitsotApp {
         page_frame(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(RichText::new("Repositories").size(26.0).strong());
-                    ui.label(RichText::new("Git repositories you work with. Any Git host works.").weak());
+                    theme::page_header(ui, "Repositories", "Git repositories you work with. Drag a card onto a group to move it.");
                 });
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                     if theme::primary(ui, "+ New").on_hover_text("Create a new repository").clicked() {
@@ -1158,8 +1165,6 @@ impl GitsotApp {
                     ui.add(TextEdit::singleline(&mut self.repo_filter).hint_text("Search repositories").desired_width(200.0));
                 });
             });
-            ui.add_space(18.0);
-
             if self.cards.is_empty() {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
@@ -1205,36 +1210,59 @@ impl GitsotApp {
                 let mut over_group: Option<String> = None;
                 for (group, list) in &groups {
                     let section = ui.scope(|ui| {
+                        let collapsed = !group.is_empty() && filter.is_empty() && self.settings.collapsed_groups.contains(group);
                         ui.horizontal(|ui| {
-                            let title = if group.is_empty() { "Ungrouped" } else { group.as_str() };
-                            ui.label(RichText::new(format!("{title}  ({})", list.len())).strong().weak());
-                            if !group.is_empty() {
-                                ui.menu_button(RichText::new("☰").small(), |ui| {
-                                    if ui.button("Rename group…").clicked() {
-                                        actions.push(Action::AskGroupName(Some(group.clone())));
-                                        ui.close();
-                                    }
-                                    if ui.button("Delete group").on_hover_text("Its repositories become ungrouped").clicked() {
-                                        actions.push(Action::DeleteGroup(group.clone()));
-                                        ui.close();
-                                    }
-                                });
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let count = match list.len() {
+                                1 => "1 repository".to_string(),
+                                n => format!("{n} repositories"),
+                            };
+                            if group.is_empty() {
+                                ui.label(RichText::new("Ungrouped").size(15.0).strong().weak());
+                                ui.label(RichText::new(count).small().weak());
+                            } else {
+                                let arrow = theme::fold_arrow(ui, collapsed);
+                                let name = ui.add(
+                                    egui::Label::new(RichText::new(group.as_str()).size(15.0).strong())
+                                        .truncate()
+                                        .sense(Sense::click()),
+                                );
+                                if arrow
+                                    .union(name)
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text(if collapsed { "Show repositories" } else { "Hide repositories" })
+                                    .clicked()
+                                {
+                                    actions.push(Action::ToggleGroup(group.clone()));
+                                }
+                                ui.label(RichText::new(count).small().weak());
+                                ui.add_space(8.0);
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                if theme::icon_button(ui, theme::Icon::Rename, "Rename group").clicked() {
+                                    actions.push(Action::AskGroupName(Some(group.clone())));
+                                }
+                                if theme::icon_button(ui, theme::Icon::Delete, "Delete group (its repositories become ungrouped)").clicked() {
+                                    actions.push(Action::DeleteGroup(group.clone()));
+                                }
                             }
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(4.0);
+                        if collapsed {
+                            return;
+                        }
                         if list.is_empty() {
                             let (rect, _) = ui.allocate_exact_size(Vec2::new(card_w, 56.0), Sense::hover());
                             ui.painter().rect_stroke(
                                 rect,
-                                10.0,
-                                Stroke::new(1.0, ui.visuals().weak_text_color()),
+                                8.0,
+                                Stroke::new(1.0, theme::pal(ui).border),
                                 egui::StrokeKind::Inside,
                             );
                             ui.painter().text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 "Drag repositories here",
-                                egui::FontId::proportional(13.0),
+                                egui::FontId::proportional(14.0),
                                 ui.visuals().weak_text_color(),
                             );
                             ui.add_space(gap);
@@ -1260,8 +1288,9 @@ impl GitsotApp {
                     if dragging && zone.contains_pointer() {
                         over_group = Some(group.clone());
                         let rect = zone.rect.expand(6.0);
-                        ui.painter().rect_filled(rect, 12.0, theme::BLUE.gamma_multiply(0.08));
-                        ui.painter().rect_stroke(rect, 12.0, Stroke::new(1.5, theme::BLUE), egui::StrokeKind::Inside);
+                        let accent = theme::pal(ui).accent_text;
+                        ui.painter().rect_filled(rect, 8.0, accent.gamma_multiply(0.10));
+                        ui.painter().rect_stroke(rect, 8.0, Stroke::new(2.0, accent), egui::StrokeKind::Inside);
                     }
                     if let Some(drop) = zone.dnd_release_payload::<CardDrag>() {
                         actions.push(Action::SetGroup(drop.0.clone(), group.clone()));
@@ -1348,53 +1377,36 @@ impl GitsotApp {
 
     fn settings_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         page_frame(ui, |ui| {
-            ui.label(RichText::new("Settings").size(26.0).strong());
-            ui.add_space(14.0);
-
-            theme::card_frame(ui, false).show(ui, |ui| {
-                ui.set_width(560.0);
-                ui.label(RichText::new("Appearance").strong());
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let light = self.settings.light_mode;
-                    if ui.add(egui::Button::selectable(!light, "Dark")).clicked() && light {
-                        actions.push(Action::SetLightMode(false));
-                    }
-                    if ui.add(egui::Button::selectable(light, "Light")).clicked() && !light {
-                        actions.push(Action::SetLightMode(true));
-                    }
-                });
-            });
-            ui.add_space(12.0);
-
+            theme::page_header(ui, "Settings", "Appearance, commit identities and Git.");
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            theme::card_frame(ui, false).show(ui, |ui| {
-                ui.set_width(560.0);
-                ui.label(RichText::new("Identity").strong());
-                ui.label(
-                    RichText::new("The name and email recorded in every commit. Check it before you commit or push.")
-                        .small()
-                        .weak(),
-                );
-                ui.add_space(6.0);
+                ui.set_max_width(600.0);
+
+                theme::section(ui, "Appearance", "Colors of the sidebar, pages and dialogs.");
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    for (tab, label) in [(IdTab::Global, "Global"), (IdTab::Repo, "This repository")] {
-                        let enabled = tab == IdTab::Global || self.repo.is_some();
-                        let resp = if self.id_tab == tab {
-                            theme::primary(ui, label)
-                        } else {
-                            ui.add_enabled(enabled, egui::Button::new(label))
-                        };
-                        if resp.clicked() {
-                            self.id_tab = tab;
-                        }
+                    let mut light = self.settings.light_mode;
+                    ui.selectable_value(&mut light, false, "Dark");
+                    ui.selectable_value(&mut light, true, "Light");
+                    if light != self.settings.light_mode {
+                        actions.push(Action::SetLightMode(light));
                     }
                 });
-                ui.add_space(8.0);
+
+                ui.add_space(20.0);
+                theme::section(
+                    ui,
+                    "Identity",
+                    "The name and email recorded in every commit. Check it before you commit or push.",
+                );
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.id_tab, IdTab::Global, "Global");
+                    ui.add_enabled_ui(self.repo.is_some(), |ui| {
+                        ui.selectable_value(&mut self.id_tab, IdTab::Repo, "This repository");
+                    });
+                });
+                ui.add_space(4.0);
                 match (self.id_tab, &self.repo) {
                     (IdTab::Repo, Some(r)) => {
-                        ui.label(RichText::new(format!("{}  ·  {}", r.name(), r.path.display())).small().weak());
+                        ui.add(egui::Label::new(RichText::new(format!("{}  ·  {}", r.name(), r.path.display())).small().weak()).truncate());
                         ui.horizontal(|ui| {
                             ui.label("Commits are made as:");
                             identity_line(ui, &r.id_status, false);
@@ -1406,12 +1418,8 @@ impl GitsotApp {
                                     .weak(),
                             );
                         }
-                        ui.add_space(6.0);
-                        ui.label("Name (this repository only)");
-                        ui.add(TextEdit::singleline(&mut self.local_form.name).hint_text("Uses global / folder rule").desired_width(f32::INFINITY));
-                        ui.label("Email (this repository only)");
-                        ui.add(TextEdit::singleline(&mut self.local_form.email).hint_text("Uses global / folder rule").desired_width(f32::INFINITY));
-                        ui.add_space(6.0);
+                        field(ui, "Name (this repository only)", &mut self.local_form.name, "Uses global / folder rule");
+                        field(ui, "Email (this repository only)", &mut self.local_form.email, "Uses global / folder rule");
                         ui.horizontal(|ui| {
                             if theme::primary(ui, "Save for this repository").clicked() {
                                 actions.push(Action::SetLocalIdentity(self.local_form.clone()));
@@ -1427,11 +1435,8 @@ impl GitsotApp {
                         ui.label(RichText::new("Saved in this repository's .git/config. It wins over global and folder rules.").small().weak());
                     }
                     _ => {
-                        ui.label("Name");
-                        ui.add(TextEdit::singleline(&mut self.identity.0).hint_text("Your Name").desired_width(f32::INFINITY));
-                        ui.label("Email");
-                        ui.add(TextEdit::singleline(&mut self.identity.1).hint_text("you@example.com").desired_width(f32::INFINITY));
-                        ui.add_space(6.0);
+                        field(ui, "Name", &mut self.identity.0, "Your Name");
+                        field(ui, "Email", &mut self.identity.1, "you@example.com");
                         if theme::primary(ui, "Save global").clicked() {
                             actions.push(Action::SetIdentity {
                                 name: self.identity.0.clone(),
@@ -1442,62 +1447,56 @@ impl GitsotApp {
                         ui.label(RichText::new("Used everywhere unless a folder rule or repository setting says otherwise.").small().weak());
                     }
                 }
-            });
-            ui.add_space(12.0);
 
-            theme::card_frame(ui, false).show(ui, |ui| {
-                ui.set_width(560.0);
-                ui.label(RichText::new("Folder rules").strong());
-                ui.label(
-                    RichText::new(
-                        "Every repository inside a folder uses that folder's identity, for example all of \
-                         C:\\work\\company uses your company email. Stored as Git includeIf rules, so the git \
-                         command follows them too. Gitsot warns you before committing or pushing with a different email.",
-                    )
-                    .small()
-                    .weak(),
+                ui.add_space(20.0);
+                theme::section(
+                    ui,
+                    "Folder rules",
+                    "Every repository inside a folder uses that folder's identity, for example all of \
+                     C:\\work\\company uses your company email. Stored as Git includeIf rules, so the git \
+                     command follows them too. Gitsot warns you before committing or pushing with a different email.",
                 );
-                ui.add_space(6.0);
                 if self.rules.is_empty() {
                     ui.label(RichText::new("No folder rules yet.").weak());
                 }
                 for rule in self.rules.clone() {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Remove").clicked() {
-                            actions.push(Action::RemoveRule(rule.clone()));
-                        }
-                        ui.vertical(|ui| {
-                            ui.add(egui::Label::new(RichText::new(&rule.folder).strong()).truncate())
-                                .on_hover_text(&rule.folder);
-                            ui.label(RichText::new(format!("uses {}", rule.identity.display())).weak());
+                    theme::card_frame(ui, false).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.set_max_width(ui.available_width() - 40.0);
+                                ui.add(egui::Label::new(RichText::new(&rule.folder).monospace().strong()).truncate())
+                                    .on_hover_text(&rule.folder);
+                                ui.label(RichText::new(format!("uses {}", rule.identity.display())).small().weak());
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if theme::icon_button(ui, theme::Icon::Delete, "Remove rule").clicked() {
+                                    actions.push(Action::RemoveRule(rule.clone()));
+                                }
+                            });
                         });
                     });
-                    ui.add_space(4.0);
                 }
-                ui.separator();
-                ui.label(RichText::new("Add a rule").small().strong());
+                ui.add_space(8.0);
+                ui.label(RichText::new("Add a rule").strong());
+                ui.label(RichText::new("Folder").small().weak());
                 ui.horizontal(|ui| {
-                    ui.add(TextEdit::singleline(&mut self.rule_form.0).hint_text("Folder, e.g. C:\\work\\company").desired_width(400.0));
+                    ui.add(TextEdit::singleline(&mut self.rule_form.0).hint_text("e.g. C:\\work\\company").desired_width(ui.available_width() - 90.0));
                     if ui.button("Browse…").clicked() {
                         if let Some(d) = rfd::FileDialog::new().set_title("Folder for this identity").pick_folder() {
                             self.rule_form.0 = d.display().to_string();
                         }
                     }
                 });
-                ui.horizontal(|ui| {
-                    ui.add(TextEdit::singleline(&mut self.rule_form.1.name).hint_text("Name").desired_width(180.0));
-                    ui.add(TextEdit::singleline(&mut self.rule_form.1.email).hint_text("Email").desired_width(220.0));
-                    let ok = !self.rule_form.0.trim().is_empty() && !self.rule_form.1.email.trim().is_empty();
-                    if theme::primary_enabled(ui, ok, "Add rule").clicked() {
-                        actions.push(Action::AddRule { folder: self.rule_form.0.clone(), identity: self.rule_form.1.clone() });
-                    }
-                });
-            });
-            ui.add_space(12.0);
+                field(ui, "Name", &mut self.rule_form.1.name, "Name for this folder");
+                field(ui, "Email", &mut self.rule_form.1.email, "you@company.com");
+                let ok = !self.rule_form.0.trim().is_empty() && !self.rule_form.1.email.trim().is_empty();
+                if theme::primary_enabled(ui, ok, "Add rule").clicked() {
+                    actions.push(Action::AddRule { folder: self.rule_form.0.clone(), identity: self.rule_form.1.clone() });
+                }
 
-            theme::card_frame(ui, false).show(ui, |ui| {
-                ui.set_width(560.0);
-                ui.label(RichText::new("Git command").strong());
+                ui.add_space(20.0);
+                theme::section(ui, "Git command", "");
                 if self.git_cli {
                     ui.label(RichText::new("Found on PATH. Used for clone, fetch, pull and push.").weak());
                 } else {
@@ -1506,7 +1505,7 @@ impl GitsotApp {
                             .color(theme::ORANGE),
                     );
                 }
-            });
+                ui.add_space(12.0);
             });
         });
     }
@@ -1851,10 +1850,16 @@ impl GitsotApp {
     }
 }
 
+/// Labelled single-line text field that fills the available width (termker's field).
+fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
+    ui.label(RichText::new(label).small().weak());
+    ui.add(TextEdit::singleline(value).hint_text(hint).desired_width(f32::INFINITY));
+}
+
 /// Standard padding around a full page.
 fn page_frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
-        .inner_margin(egui::Margin { left: 24, right: 24, top: 18, bottom: 12 })
+        .inner_margin(egui::Margin::same(24))
         .show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             add(ui)
@@ -1887,10 +1892,10 @@ fn drag_chip(ctx: &egui::Context, name: &str, over_group: Option<&str>) {
         .fixed_pos(pointer + Vec2::new(14.0, 14.0))
         .interactable(false)
         .show(ctx, |ui| {
-            let dark = ui.visuals().dark_mode;
+            let p = theme::pal(ui);
             egui::Frame::new()
-                .fill(theme::card_bg(dark))
-                .stroke(Stroke::new(1.0, theme::BLUE))
+                .fill(p.surface)
+                .stroke(Stroke::new(1.0, p.accent_text))
                 .corner_radius(6)
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
@@ -1901,7 +1906,7 @@ fn drag_chip(ctx: &egui::Context, name: &str, over_group: Option<&str>) {
                         Some(g) => format!("Drop to move to {g}"),
                         None => "Drop on a group".to_string(),
                     };
-                    ui.add(egui::Label::new(RichText::new(hint).small().color(theme::BLUE_HOVER)).extend());
+                    ui.add(egui::Label::new(RichText::new(hint).small().color(p.accent_text)).extend());
                 });
         });
 }
@@ -1933,14 +1938,14 @@ fn repo_card_body(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f
                     }
                 });
                 if is_current {
-                    ui.label(RichText::new("Current").small().color(theme::BLUE));
+                    ui.label(RichText::new("Current").small().color(theme::pal(ui).accent_text));
                 }
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.add(egui::Label::new(RichText::new(&card.name).size(16.0).strong()).truncate());
+                    ui.add(egui::Label::new(RichText::new(&card.name).size(15.0).strong()).truncate());
                 });
             });
         });
-        ui.add(egui::Label::new(RichText::new(card.path.display().to_string()).small().weak()).truncate())
+        ui.add(egui::Label::new(RichText::new(card.path.display().to_string()).monospace().small().weak()).truncate())
             .on_hover_text(card.path.display().to_string());
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -1958,7 +1963,7 @@ fn repo_card_body(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f
         }
         ui.add_space(6.0);
         let label = if is_current { "Go to changes" } else { "Open" };
-        if theme::primary_wide(ui, card.exists, label, 30.0).clicked() {
+        if theme::primary_wide(ui, card.exists, label, 28.0).clicked() {
             actions.push(if is_current { Action::GoTo(Page::Changes) } else { Action::OpenPath(card.path.clone()) });
         }
     }

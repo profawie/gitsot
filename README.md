@@ -6,7 +6,7 @@ Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](ht
 
 ## Features
 
-- **Repositories**: your repositories as cards showing the branch, host and the **name/email that commits will use**. Organise them into **groups**: click *+ Group*, then drag cards onto a group (or use the card menu ☰ → *Move to group…*). Rename or delete a group from the ☰ next to its name. Open a local folder, clone from a URL, or create a new one.
+- **Repositories**: your repositories as cards showing the branch, host and the **name/email that commits will use**. Organise them into **groups**: click *+ Group*, then drag cards onto a group (or use the card menu ☰ → *Move to group…*). Rename or delete a group with the pencil and bin icons next to its name, and click its name to fold it. Open a local folder, clone from a URL, or create a new one.
 - **Changes**: see every changed file, tick the ones to include (stage), untick to unstage, and view a coloured diff.
 - **Commit**: summary + description, then *Commit to &lt;branch&gt;* (or <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>Enter</kbd>). If your Git name/email are not set, Gitsot asks for them once.
 - **Discard**: right-click a file (or *Discard all…*) to throw away changes, with a confirmation.
@@ -73,7 +73,7 @@ The Windows `.exe` is self-contained: no MinGW DLLs are needed at runtime.
 | --- | --- |
 | `src/main.rs` | Window setup |
 | `src/app.rs` | All the UI: sidebar, repository cards, changes, history, settings, dialogs, diff viewer |
-| `src/theme.rs` | Colours, blue buttons, logo, cards |
+| `src/theme.rs` | Colours, text sizes and widgets (same look as termker), logo, cards |
 | `src/graph.rs` | Lays out the history tree (lanes and branch lines) |
 | `src/git.rs` | Local Git operations with libgit2 (status, diff, stage, commit, branches, history) |
 | `src/identity.rs` | Global/repository identities, folder rules (`includeIf`) and mismatch checks |
