@@ -15,6 +15,7 @@ use crate::git::{
     RefLabel,
 };
 use crate::graph::{self, Graph};
+use crate::identity::{self, FolderRule, Identity};
 use crate::theme;
 use std::collections::HashMap;
 
@@ -27,15 +28,30 @@ const BRANCH_ICON: &str = "\u{E625}";
 // Persistent settings
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
     recent: Vec<PathBuf>,
     last_repo: Option<PathBuf>,
     clone_parent: Option<PathBuf>,
     light_mode: bool,
-    /// Show history as a branch tree instead of a plain list.
-    history_tree: bool,
+    /// Show history as a branch tree (default) instead of a plain list.
+    history_view_tree: bool,
+    /// Group name for each repository on the Repositories page.
+    groups: HashMap<PathBuf, String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            recent: Vec::new(),
+            last_repo: None,
+            clone_parent: None,
+            light_mode: false,
+            history_view_tree: true,
+            groups: HashMap::new(),
+        }
+    }
 }
 
 impl Settings {
@@ -77,6 +93,10 @@ struct RepoView {
     branches: Vec<BranchInfo>,
     remote_branches: Vec<String>,
     branch_filter: String,
+
+    /// Folder identity rules (kept in sync by the app) and this repo's identity check.
+    rules: Vec<FolderRule>,
+    id_status: identity::Status,
 }
 
 impl RepoView {
@@ -106,6 +126,8 @@ impl RepoView {
             branches: Vec::new(),
             remote_branches: Vec::new(),
             branch_filter: String::new(),
+            rules: identity::rules(),
+            id_status: identity::Status { effective: Identity::default(), source: identity::Source::Missing, rule: None },
         };
         view.refresh()?;
         Ok(view)
@@ -117,6 +139,7 @@ impl RepoView {
 
     /// Reload everything that can change behind our back.
     fn refresh(&mut self) -> anyhow::Result<()> {
+        self.id_status = identity::status(&self.repo, &self.path, &self.rules);
         self.head = git::head_info(&self.repo);
         self.remote_url = git::remote_url(&self.repo);
         self.changes = git::status(&self.repo)?;
@@ -214,10 +237,11 @@ struct RepoCard {
     branch: Option<String>,
     remote: Option<String>,
     exists: bool,
+    identity: Option<identity::Status>,
 }
 
 impl RepoCard {
-    fn load(path: &Path) -> Self {
+    fn load(path: &Path, rules: &[FolderRule]) -> Self {
         let repo = git::open(path).ok();
         RepoCard {
             path: path.to_path_buf(),
@@ -225,8 +249,15 @@ impl RepoCard {
             branch: repo.as_ref().map(|r| git::head_info(r).display_name()),
             remote: repo.as_ref().and_then(git::remote_url),
             exists: repo.is_some(),
+            identity: repo.as_ref().map(|r| identity::status(r, path, rules)),
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdTab {
+    Global,
+    Repo,
 }
 
 enum Dialog {
@@ -237,6 +268,9 @@ enum Dialog {
     ConfirmDeleteBranch { name: String },
     Message { title: String, text: String },
     SignIn { op: NetOp, host: String, username: String, password: String, retry: bool },
+    /// About to commit or push with an identity that doesn't match the folder rule.
+    IdentityWarning { push: Option<NetOp>, rule: FolderRule, effective: Identity, bad_commits: Vec<(String, String)> },
+    SetGroup { path: PathBuf, name: String },
 }
 
 /// Things the user asked for while drawing the UI; applied afterwards so we
@@ -274,6 +308,17 @@ enum Action {
     ForgetRecent(PathBuf),
     GoTo(Page),
     SetHistoryTree(bool),
+    SetLocalIdentity(Identity),
+    EditRepoIdentity,
+    ClearLocalIdentity,
+    AddRule { folder: String, identity: Identity },
+    RemoveRule(FolderRule),
+    /// Use the folder rule's identity for this repository, then commit.
+    AdoptRuleAndCommit(Identity),
+    CommitIgnoringIdentity,
+    PushIgnoringIdentity(NetOp),
+    AskGroup(PathBuf),
+    SetGroup(PathBuf, String),
 }
 
 struct Toast {
@@ -289,6 +334,11 @@ pub struct GitsotApp {
     cards: Vec<RepoCard>,
     repo_filter: String,
     identity: (String, String),
+    rules: Vec<FolderRule>,
+    id_tab: IdTab,
+    local_form: Identity,
+    rule_form: (String, Identity),
+    skip_identity_check: bool,
     dialog: Option<Dialog>,
     toast: Option<Toast>,
     busy: Option<String>,
@@ -313,7 +363,12 @@ impl GitsotApp {
             page: Page::Repositories,
             cards: Vec::new(),
             repo_filter: String::new(),
-            identity: git::identity(None),
+            identity: { let g = identity::global(); (g.name, g.email) },
+            rules: identity::rules(),
+            id_tab: IdTab::Global,
+            local_form: Identity::default(),
+            rule_form: (String::new(), Identity::default()),
+            skip_identity_check: false,
             dialog: None,
             toast: None,
             busy: None,
@@ -340,7 +395,21 @@ impl GitsotApp {
     }
 
     fn reload_cards(&mut self) {
-        self.cards = self.settings.recent.iter().map(|p| RepoCard::load(p)).collect();
+        let rules = self.rules.clone();
+        self.cards = self.settings.recent.iter().map(|p| RepoCard::load(p, &rules)).collect();
+    }
+
+    /// Re-read identity rules and push them to the open repository.
+    fn reload_identity(&mut self) {
+        self.rules = identity::rules();
+        let g = identity::global();
+        self.identity = (g.name, g.email);
+        if let Some(r) = &mut self.repo {
+            r.rules = self.rules.clone();
+            r.id_status = identity::status(&r.repo, &r.path, &r.rules);
+            self.local_form = identity::local(&r.repo).unwrap_or_default();
+        }
+        self.reload_cards();
     }
 
     fn info(&mut self, text: impl Into<String>) {
@@ -363,7 +432,7 @@ impl GitsotApp {
                 self.info(format!("Opened {}", view.name()));
                 self.repo = Some(view);
                 self.page = Page::Changes;
-                self.reload_cards();
+                self.reload_identity();
             }
             Err(e) => self.error(format!("{e:#}")),
         }
@@ -445,19 +514,19 @@ impl GitsotApp {
                     self.reload_cards();
                 }
                 if page == Page::Settings {
-                    self.identity = git::identity(None);
+                    self.reload_identity();
                 }
                 if page == Page::History {
                     if let Some(r) = &mut self.repo {
-                        if !r.history_loaded || r.history_all != self.settings.history_tree {
-                            r.load_history(self.settings.history_tree);
+                        if !r.history_loaded || r.history_all != self.settings.history_view_tree {
+                            r.load_history(self.settings.history_view_tree);
                         }
                     }
                 }
                 self.page = page;
             }
             Action::SetHistoryTree(tree) => {
-                self.settings.history_tree = tree;
+                self.settings.history_view_tree = tree;
                 if let Some(r) = &mut self.repo {
                     r.load_history(tree);
                 }
@@ -478,9 +547,9 @@ impl GitsotApp {
                     self.error("Please enter both a name and an email");
                     return;
                 }
-                match git::set_global_identity(&name, &email) {
+                match identity::set_global(&Identity { name: name.clone(), email: email.clone() }) {
                     Ok(()) => {
-                        self.identity = (name.trim().to_string(), email.trim().to_string());
+                        self.reload_identity();
                         self.dialog = None;
                         if commit_after {
                             self.apply(ctx, Action::Commit);
@@ -489,6 +558,84 @@ impl GitsotApp {
                         }
                     }
                     Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+            Action::AddRule { folder, identity: id } => {
+                match identity::add_rule(Path::new(&folder), &id) {
+                    Ok(()) => {
+                        self.rule_form = (String::new(), Identity::default());
+                        self.reload_identity();
+                        self.info(format!("Repositories under {folder} will now use {}", id.display()));
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+            Action::RemoveRule(rule) => match identity::remove_rule(&rule) {
+                Ok(()) => {
+                    self.reload_identity();
+                    self.info(format!("Removed the rule for {}", rule.folder));
+                }
+                Err(e) => self.error(format!("{e:#}")),
+            },
+            Action::SetLocalIdentity(id) => {
+                let Some(r) = &self.repo else { return };
+                match identity::set_local(&r.repo, &id) {
+                    Ok(()) => {
+                        self.reload_identity();
+                        self.info(format!("This repository now commits as {}", id.display()));
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+            Action::ClearLocalIdentity => {
+                let Some(r) = &self.repo else { return };
+                match identity::clear_local(&r.repo) {
+                    Ok(()) => {
+                        self.reload_identity();
+                        self.info("This repository now uses the global identity or folder rule");
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+            Action::AdoptRuleAndCommit(id) => {
+                self.dialog = None;
+                if let Some(r) = &self.repo {
+                    if let Err(e) = identity::set_local(&r.repo, &id) {
+                        self.error(format!("{e:#}"));
+                        return;
+                    }
+                }
+                self.reload_identity();
+                self.apply(ctx, Action::Commit);
+            }
+            Action::CommitIgnoringIdentity => {
+                self.dialog = None;
+                self.skip_identity_check = true;
+                self.apply(ctx, Action::Commit);
+                self.skip_identity_check = false;
+            }
+            Action::PushIgnoringIdentity(op) => {
+                self.dialog = None;
+                self.skip_identity_check = true;
+                self.start_net(ctx, op, None);
+                self.skip_identity_check = false;
+            }
+            Action::EditRepoIdentity => {
+                self.reload_identity();
+                self.id_tab = IdTab::Repo;
+                self.page = Page::Settings;
+            }
+            Action::AskGroup(path) => {
+                let name = self.settings.groups.get(&path).cloned().unwrap_or_default();
+                self.dialog = Some(Dialog::SetGroup { path, name });
+            }
+            Action::SetGroup(path, name) => {
+                self.dialog = None;
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    self.settings.groups.remove(&path);
+                } else {
+                    self.settings.groups.insert(path, name);
                 }
             }
             other => {
@@ -515,9 +662,24 @@ impl GitsotApp {
                         }
                         Action::Commit => {
                             if git::signature(&r.repo).is_err() {
-                                let (name, email) = git::identity(Some(&r.repo));
-                                self.dialog = Some(Dialog::Identity { name, email, commit_after: true });
+                                let id = identity::effective(&r.repo);
+                                self.dialog = Some(Dialog::Identity { name: id.name, email: id.email, commit_after: true });
                                 return Ok(None);
+                            }
+                            r.id_status = identity::status(&r.repo, &r.path, &r.rules);
+                            if !self.skip_identity_check {
+                                if let Some(rule) = r.id_status.mismatch() {
+                                    if r.summary.trim().is_empty() {
+                                        anyhow::bail!("Please write a commit summary");
+                                    }
+                                    self.dialog = Some(Dialog::IdentityWarning {
+                                        push: None,
+                                        rule: rule.clone(),
+                                        effective: r.id_status.effective.clone(),
+                                        bad_commits: Vec::new(),
+                                    });
+                                    return Ok(None);
+                                }
                             }
                             let mut msg = r.summary.trim().to_string();
                             if msg.is_empty() {
@@ -636,6 +798,23 @@ impl GitsotApp {
                      clone, fetch, pull and push. Install Git from https://git-scm.com and restart.",
                 );
                 return;
+            }
+        }
+        if let (NetOp::Push { .. }, Some(r), false) = (&op, &self.repo, self.skip_identity_check) {
+            if let Some(rule) = identity::rule_for(&r.rules, &r.path) {
+                let bad: Vec<(String, String)> = identity::unpushed_authors(&r.repo)
+                    .into_iter()
+                    .filter(|(_, email)| !email.eq_ignore_ascii_case(rule.identity.email.trim()))
+                    .collect();
+                if !bad.is_empty() {
+                    self.dialog = Some(Dialog::IdentityWarning {
+                        push: Some(op),
+                        rule: rule.clone(),
+                        effective: identity::effective(&r.repo),
+                        bad_commits: bad,
+                    });
+                    return;
+                }
             }
         }
         let repo_path = match &op {
@@ -954,23 +1133,39 @@ impl GitsotApp {
                 .iter()
                 .filter(|c| filter.is_empty() || c.name.to_lowercase().contains(&filter) || c.path.to_string_lossy().to_lowercase().contains(&filter))
                 .collect();
-            ui.label(RichText::new(format!("Recent  ({})", cards.len())).small().weak());
-            ui.add_space(6.0);
 
             let current = self.repo.as_ref().map(|r| r.path.clone());
-            let card_w = 280.0;
+            let card_w = 300.0;
             let gap = 14.0;
             let per_row = (((ui.available_width() + gap) / (card_w + gap)).floor() as usize).max(1);
+
+            // Group the cards; named groups A–Z first, then "Ungrouped".
+            let mut groups: Vec<(String, Vec<&RepoCard>)> = Vec::new();
+            for card in cards {
+                let g = self.settings.groups.get(&card.path).cloned().unwrap_or_default();
+                match groups.iter_mut().find(|(name, _)| *name == g) {
+                    Some((_, list)) => list.push(card),
+                    None => groups.push((g, vec![card])),
+                }
+            }
+            groups.sort_by_key(|(name, _)| (name.is_empty(), name.to_lowercase()));
+
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                for chunk in cards.chunks(per_row) {
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = gap;
-                        for card in chunk {
-                            let is_current = current.as_ref() == Some(&card.path);
-                            repo_card(ui, card, is_current, card_w, actions);
-                        }
-                    });
-                    ui.add_space(gap);
+                for (group, list) in &groups {
+                    let title = if group.is_empty() { "Ungrouped" } else { group.as_str() };
+                    ui.label(RichText::new(format!("{title}  ({})", list.len())).strong().weak());
+                    ui.add_space(6.0);
+                    for chunk in list.chunks(per_row) {
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for card in chunk {
+                                let is_current = current.as_ref() == Some(&card.path);
+                                repo_card(ui, card, is_current, card_w, actions);
+                            }
+                        });
+                        ui.add_space(gap);
+                    }
+                    ui.add_space(8.0);
                 }
             });
         });
@@ -979,7 +1174,7 @@ impl GitsotApp {
     fn repo_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let busy = self.busy.is_some();
         let page = self.page;
-        let history_tree = self.settings.history_tree;
+        let history_tree = self.settings.history_view_tree;
         let Some(r) = self.repo.as_mut() else { return };
 
         // Header: repository name, branch picker and remote buttons.
@@ -1053,7 +1248,7 @@ impl GitsotApp {
             ui.add_space(14.0);
 
             theme::card_frame(ui, false).show(ui, |ui| {
-                ui.set_width(460.0);
+                ui.set_width(560.0);
                 ui.label(RichText::new("Appearance").strong());
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -1068,28 +1263,135 @@ impl GitsotApp {
             });
             ui.add_space(12.0);
 
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             theme::card_frame(ui, false).show(ui, |ui| {
-                ui.set_width(460.0);
-                ui.label(RichText::new("Git identity").strong());
-                ui.label(RichText::new("Recorded with every commit. Saved in your global Git config.").small().weak());
+                ui.set_width(560.0);
+                ui.label(RichText::new("Identity").strong());
+                ui.label(
+                    RichText::new("The name and email recorded in every commit. Check it before you commit or push.")
+                        .small()
+                        .weak(),
+                );
                 ui.add_space(6.0);
-                ui.label("Name");
-                ui.add(TextEdit::singleline(&mut self.identity.0).hint_text("Your Name").desired_width(f32::INFINITY));
-                ui.label("Email");
-                ui.add(TextEdit::singleline(&mut self.identity.1).hint_text("you@example.com").desired_width(f32::INFINITY));
-                ui.add_space(6.0);
-                if theme::primary(ui, "Save").clicked() {
-                    actions.push(Action::SetIdentity {
-                        name: self.identity.0.clone(),
-                        email: self.identity.1.clone(),
-                        commit_after: false,
-                    });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (tab, label) in [(IdTab::Global, "Global"), (IdTab::Repo, "This repository")] {
+                        let enabled = tab == IdTab::Global || self.repo.is_some();
+                        let resp = if self.id_tab == tab {
+                            theme::primary(ui, label)
+                        } else {
+                            ui.add_enabled(enabled, egui::Button::new(label))
+                        };
+                        if resp.clicked() {
+                            self.id_tab = tab;
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+                match (self.id_tab, &self.repo) {
+                    (IdTab::Repo, Some(r)) => {
+                        ui.label(RichText::new(format!("{}  ·  {}", r.name(), r.path.display())).small().weak());
+                        ui.horizontal(|ui| {
+                            ui.label("Commits are made as:");
+                            identity_line(ui, &r.id_status, false);
+                        });
+                        if let Some(rule) = &r.id_status.rule {
+                            ui.label(
+                                RichText::new(format!("Folder rule for {}: {}", rule.folder, rule.identity.display()))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                        ui.add_space(6.0);
+                        ui.label("Name (this repository only)");
+                        ui.add(TextEdit::singleline(&mut self.local_form.name).hint_text("Uses global / folder rule").desired_width(f32::INFINITY));
+                        ui.label("Email (this repository only)");
+                        ui.add(TextEdit::singleline(&mut self.local_form.email).hint_text("Uses global / folder rule").desired_width(f32::INFINITY));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if theme::primary(ui, "Save for this repository").clicked() {
+                                actions.push(Action::SetLocalIdentity(self.local_form.clone()));
+                            }
+                            if let Some(rule) = &r.id_status.rule {
+                                if ui.button(format!("Use folder rule ({})", rule.identity.email)).clicked() {
+                                    actions.push(Action::ClearLocalIdentity);
+                                }
+                            } else if identity::local(&r.repo).is_some() && ui.button("Use global").clicked() {
+                                actions.push(Action::ClearLocalIdentity);
+                            }
+                        });
+                        ui.label(RichText::new("Saved in this repository's .git/config. It wins over global and folder rules.").small().weak());
+                    }
+                    _ => {
+                        ui.label("Name");
+                        ui.add(TextEdit::singleline(&mut self.identity.0).hint_text("Your Name").desired_width(f32::INFINITY));
+                        ui.label("Email");
+                        ui.add(TextEdit::singleline(&mut self.identity.1).hint_text("you@example.com").desired_width(f32::INFINITY));
+                        ui.add_space(6.0);
+                        if theme::primary(ui, "Save global").clicked() {
+                            actions.push(Action::SetIdentity {
+                                name: self.identity.0.clone(),
+                                email: self.identity.1.clone(),
+                                commit_after: false,
+                            });
+                        }
+                        ui.label(RichText::new("Used everywhere unless a folder rule or repository setting says otherwise.").small().weak());
+                    }
                 }
             });
             ui.add_space(12.0);
 
             theme::card_frame(ui, false).show(ui, |ui| {
-                ui.set_width(460.0);
+                ui.set_width(560.0);
+                ui.label(RichText::new("Folder rules").strong());
+                ui.label(
+                    RichText::new(
+                        "Every repository inside a folder uses that folder's identity, for example all of \
+                         C:\\work\\company uses your company email. Stored as Git includeIf rules, so the git \
+                         command follows them too. Gitsot warns you before committing or pushing with a different email.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                if self.rules.is_empty() {
+                    ui.label(RichText::new("No folder rules yet.").weak());
+                }
+                for rule in self.rules.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("📁").weak());
+                        ui.label(RichText::new(&rule.folder).strong());
+                        ui.label(RichText::new(format!("→ {}", rule.identity.display())).weak());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                actions.push(Action::RemoveRule(rule.clone()));
+                            }
+                        });
+                    });
+                }
+                ui.separator();
+                ui.label(RichText::new("Add a rule").small().strong());
+                ui.horizontal(|ui| {
+                    ui.add(TextEdit::singleline(&mut self.rule_form.0).hint_text("Folder, e.g. C:\\work\\company").desired_width(400.0));
+                    if ui.button("Browse…").clicked() {
+                        if let Some(d) = rfd::FileDialog::new().set_title("Folder for this identity").pick_folder() {
+                            self.rule_form.0 = d.display().to_string();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add(TextEdit::singleline(&mut self.rule_form.1.name).hint_text("Name").desired_width(180.0));
+                    ui.add(TextEdit::singleline(&mut self.rule_form.1.email).hint_text("Email").desired_width(220.0));
+                    let ok = !self.rule_form.0.trim().is_empty() && !self.rule_form.1.email.trim().is_empty();
+                    if theme::primary_enabled(ui, ok, "Add rule").clicked() {
+                        actions.push(Action::AddRule { folder: self.rule_form.0.clone(), identity: self.rule_form.1.clone() });
+                    }
+                });
+            });
+            ui.add_space(12.0);
+
+            theme::card_frame(ui, false).show(ui, |ui| {
+                ui.set_width(560.0);
                 ui.label(RichText::new("Git command").strong());
                 if self.git_cli {
                     ui.label(RichText::new("Found on PATH. Used for clone, fetch, pull and push.").weak());
@@ -1099,6 +1401,7 @@ impl GitsotApp {
                             .color(theme::ORANGE),
                     );
                 }
+            });
             });
         });
     }
@@ -1323,6 +1626,82 @@ impl GitsotApp {
                         }
                     });
                 }
+                Dialog::IdentityWarning { push, rule, effective, bad_commits } => {
+                    ui.label(RichText::new("⚠ Check your identity").size(20.0).color(theme::ORANGE));
+                    ui.add_space(6.0);
+                    ui.label(format!("This repository is inside {}, which uses:", rule.folder));
+                    ui.label(RichText::new(rule.identity.display()).strong());
+                    ui.add_space(4.0);
+                    if push.is_none() {
+                        ui.label("But this commit would be made as:");
+                        ui.label(RichText::new(effective.display()).strong().color(theme::RED));
+                    } else {
+                        ui.label(format!("But {} commit(s) you are about to push were made with another email:", bad_commits.len()));
+                        egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                            for (id, email) in bad_commits.iter() {
+                                ui.label(RichText::new(format!("{id}  {email}")).monospace().color(theme::RED));
+                            }
+                        });
+                        ui.label(
+                            RichText::new("Pushing shares these commits with everyone on the remote.")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        match push {
+                            None => {
+                                if theme::primary(ui, format!("Use {} and commit", rule.identity.email)).clicked() {
+                                    actions.push(Action::AdoptRuleAndCommit(rule.identity.clone()));
+                                }
+                                if ui.button("Commit anyway").clicked() {
+                                    actions.push(Action::CommitIgnoringIdentity);
+                                }
+                            }
+                            Some(op) => {
+                                if ui.button(RichText::new("Push anyway").color(theme::RED)).clicked() {
+                                    actions.push(Action::PushIgnoringIdentity(op.clone()));
+                                }
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::SetGroup { path, name } => {
+                    ui.heading("Move to group");
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(path.display().to_string()).small().weak());
+                    ui.add_space(6.0);
+                    let resp = ui.add(TextEdit::singleline(name).hint_text("Group name, e.g. Company").desired_width(f32::INFINITY));
+                    resp.request_focus();
+                    let mut existing: Vec<String> = self.settings.groups.values().cloned().collect();
+                    existing.sort();
+                    existing.dedup();
+                    if !existing.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Existing:").small().weak());
+                            for g in existing {
+                                if ui.small_button(&g).clicked() {
+                                    *name = g;
+                                }
+                            }
+                        });
+                    }
+                    ui.label(RichText::new("Leave empty to remove it from its group.").small().weak());
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if theme::primary(ui, "Save").clicked() || enter {
+                            actions.push(Action::SetGroup(path.clone(), name.clone()));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
                 Dialog::Message { title, text } => {
                     ui.heading(title.as_str());
                     ui.add_space(6.0);
@@ -1372,12 +1751,24 @@ fn repo_card_body(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f
         ui.set_min_width(width - 28.0);
         ui.set_max_width(width - 28.0);
         ui.horizontal(|ui| {
-            ui.add(egui::Label::new(RichText::new(&card.name).size(16.0).strong()).truncate());
-            if is_current {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new("Current").small().color(theme::BLUE));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.menu_button("☰", |ui| {
+                    if ui.button("Move to group…").clicked() {
+                        actions.push(Action::AskGroup(card.path.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Remove from list").on_hover_text("Files on disk are kept").clicked() {
+                        actions.push(Action::ForgetRecent(card.path.clone()));
+                        ui.close();
+                    }
                 });
-            }
+                if is_current {
+                    ui.label(RichText::new("Current").small().color(theme::BLUE));
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(&card.name).size(16.0).strong()).truncate());
+                });
+            });
         });
         ui.add(egui::Label::new(RichText::new(card.path.display().to_string()).small().weak()).truncate())
             .on_hover_text(card.path.display().to_string());
@@ -1391,18 +1782,50 @@ fn repo_card_body(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f
             } else {
                 ui.label(RichText::new("Folder not found").small().color(theme::RED));
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button("Remove").on_hover_text("Remove from this list (files are kept)").clicked() {
-                    actions.push(Action::ForgetRecent(card.path.clone()));
-                }
-            });
         });
+        if let Some(st) = &card.identity {
+            identity_line(ui, st, true);
+        }
         ui.add_space(6.0);
         let label = if is_current { "Go to changes" } else { "Open" };
         if theme::primary_wide(ui, card.exists, label, 30.0).clicked() {
             actions.push(if is_current { Action::GoTo(Page::Changes) } else { Action::OpenPath(card.path.clone()) });
         }
     }
+}
+
+/// "👤 Name <email>" with where it comes from; orange with a warning when it
+/// doesn't match the folder rule.
+fn identity_line(ui: &mut egui::Ui, st: &identity::Status, small: bool) {
+    let source = match &st.source {
+        identity::Source::Local => "this repo",
+        identity::Source::Rule(_) => "folder rule",
+        identity::Source::Global => "global",
+        identity::Source::Missing => "not set",
+    };
+    let mismatch = st.mismatch();
+    let text = if mismatch.is_some() {
+        format!("⚠ {}  ({source})", st.effective.display())
+    } else {
+        format!("👤 {}  ({source})", st.effective.display())
+    };
+    let mut rt = RichText::new(text);
+    if small {
+        rt = rt.small();
+    }
+    rt = match (mismatch, &st.source) {
+        (Some(_), _) | (None, identity::Source::Missing) => rt.color(theme::ORANGE),
+        _ => rt.weak(),
+    };
+    let resp = ui.add(egui::Label::new(rt).truncate());
+    match mismatch {
+        Some(rule) => resp.on_hover_text(format!(
+            "This folder's rule says {} ({}). Fix it in Settings → Identity.",
+            rule.identity.display(),
+            rule.folder
+        )),
+        None => resp.on_hover_text("Name and email recorded in commits"),
+    };
 }
 
 /// `https://gitlab.com/a/b.git` -> `gitlab.com`, `git@host:a/b` -> `host`.
@@ -1556,6 +1979,14 @@ fn changes_sidebar(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action
     // Commit box at the bottom of the sidebar.
     egui::Panel::bottom("commit_box").show(ui, |ui| {
         ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("Change").on_hover_text("Set the identity for this repository").clicked() {
+                    actions.push(Action::EditRepoIdentity);
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| identity_line(ui, &r.id_status, false));
+            });
+        });
         ui.add(
             TextEdit::singleline(&mut r.summary)
                 .hint_text("Summary (required)")
