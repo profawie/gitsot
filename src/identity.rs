@@ -179,13 +179,10 @@ pub fn folder_contains(folder: &str, repo_path: &Path) -> bool {
     path_key(repo_path).starts_with(&f) || real_path(repo_path).is_some_and(|p| path_key(&p).starts_with(&f))
 }
 
-/// The path with symlinks resolved (for example macOS `/var` → `/private/var`),
-/// because `git` matches `includeIf "gitdir:…"` against the real path. Not used on
-/// Windows, where resolving can turn mapped drives into UNC paths.
+/// The path as `git` sees it: symlinks resolved (macOS `/var` → `/private/var`)
+/// and, on Windows, short 8.3 names expanded (`RUNNER~1` → `runneradmin`).
+/// `git` matches `includeIf "gitdir:…"` against this real path.
 fn real_path(p: &Path) -> Option<std::path::PathBuf> {
-    if cfg!(windows) {
-        return None;
-    }
     // Resolve the deepest part that exists, so a folder that doesn't exist yet
     // still gets the same prefix it will have once it is created.
     let mut base = p;
@@ -196,6 +193,18 @@ fn real_path(p: &Path) -> Option<std::path::PathBuf> {
         }
         rest.push(base.file_name()?);
         base = base.parent()?;
+    };
+    let real = if cfg!(windows) {
+        // canonicalize gives \\?\C:\…; keep drive paths only, so a mapped
+        // network drive is not turned into a \\server\share path.
+        let s = real.to_string_lossy();
+        let drive = s.strip_prefix(r"\\?\")?;
+        if drive.starts_with("UNC") {
+            return None;
+        }
+        std::path::PathBuf::from(drive)
+    } else {
+        real
     };
     let full = rest.iter().rev().fold(real, |acc, part| acc.join(part));
     (full != p).then_some(full)
