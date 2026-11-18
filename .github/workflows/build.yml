@@ -1,0 +1,43 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows-gnu:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64 gcc (MSYS2)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          location: C:\
+      - name: Build with build.ps1
+        shell: pwsh
+        run: .\build.ps1
+      - name: Test
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+          cargo +stable-x86_64-pc-windows-gnu test --target x86_64-pc-windows-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitsot-windows
+          path: dist/gitsot.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with build.sh
+        run: ./build.sh
+      - name: Test
+        run: cargo test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitsot-macos
+          path: dist/Gitsot.app

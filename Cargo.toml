@@ -1,0 +1,21 @@
+[package]
+name = "gitsot"
+version = "0.1.0"
+edition = "2021"
+description = "A simple, friendly desktop Git client written in Rust"
+publish = false
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
+egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
+git2 = { version = "0.21", default-features = false }
+rfd = "0.18"
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 4
