@@ -5,15 +5,69 @@ use eframe::egui::{
     Visuals,
 };
 
-pub const BLUE: Color32 = Color32::from_rgb(47, 129, 247);
-pub const BLUE_HOVER: Color32 = Color32::from_rgb(76, 148, 250);
-pub const BLUE_ACTIVE: Color32 = Color32::from_rgb(31, 107, 214);
-pub const RED: Color32 = Color32::from_rgb(229, 83, 75);
-pub const ORANGE: Color32 = Color32::from_rgb(219, 109, 40);
+/// The look is shared with termker: same colours, text sizes, spacing and sidebar.
+#[derive(Clone, Copy)]
+pub struct Palette {
+    /// Page background.
+    pub bg: Color32,
+    /// Sidebar and dialog background.
+    pub panel: Color32,
+    /// Card and input field background.
+    pub surface: Color32,
+    pub border: Color32,
+    pub text: Color32,
+    pub text_dim: Color32,
+    /// Fill of primary buttons and of the selected item.
+    pub accent: Color32,
+    /// Accent for text, outlines and highlights, readable on the backgrounds.
+    pub accent_text: Color32,
+    pub danger: Color32,
+}
+
+const fn rgb(hex: u32) -> Color32 {
+    Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+
+pub const DARK: Palette = Palette {
+    bg: rgb(0x24272B),
+    panel: rgb(0x1C1F22),
+    surface: rgb(0x2E3237),
+    border: rgb(0x40454D),
+    text: rgb(0xE4E6E9),
+    text_dim: rgb(0xA4ABB3),
+    accent: rgb(0x0B6BA8),
+    accent_text: rgb(0x58A6FF),
+    danger: rgb(0xF87171),
+};
+
+pub const LIGHT: Palette = Palette {
+    bg: rgb(0xF6F7F8),
+    panel: rgb(0xECEEF1),
+    surface: rgb(0xFFFFFF),
+    border: rgb(0xD2D7DD),
+    text: rgb(0x1F2328),
+    text_dim: rgb(0x57606A),
+    accent: rgb(0x0969DA),
+    accent_text: rgb(0x0550AE),
+    danger: rgb(0xB91C1C),
+};
+
+pub fn palette(dark: bool) -> Palette {
+    if dark { DARK } else { LIGHT }
+}
+
+pub fn pal(ui: &Ui) -> Palette {
+    palette(ui.visuals().dark_mode)
+}
+
+/// Accent fill, used where the look doesn't matter (logo, icon).
+pub const BLUE: Color32 = DARK.accent;
+pub const RED: Color32 = rgb(0xE5534B);
+pub const ORANGE: Color32 = rgb(0xDB6D28);
 
 /// Colours for branch lanes in the history tree.
 pub const LANES: [Color32; 8] = [
-    Color32::from_rgb(47, 129, 247),  // blue
+    Color32::from_rgb(88, 166, 255),  // blue
     Color32::from_rgb(240, 136, 62),  // orange
     Color32::from_rgb(140, 200, 100), // green
     Color32::from_rgb(196, 140, 196), // mauve
@@ -27,107 +81,105 @@ pub fn lane_color(i: usize) -> Color32 {
     LANES[i % LANES.len()]
 }
 
-/// Background of the left navigation sidebar.
-pub fn nav_bg(dark: bool) -> Color32 {
-    if dark {
-        Color32::from_rgb(27, 29, 33)
-    } else {
-        Color32::from_rgb(236, 238, 242)
-    }
-}
-
-/// Background of cards.
-pub fn card_bg(dark: bool) -> Color32 {
-    if dark {
-        Color32::from_rgb(42, 45, 51)
-    } else {
-        Color32::WHITE
-    }
-}
-
-pub fn card_border(dark: bool) -> Color32 {
-    if dark {
-        Color32::from_rgb(58, 62, 70)
-    } else {
-        Color32::from_rgb(214, 218, 224)
-    }
-}
-
 pub fn apply(ctx: &egui::Context, light: bool) {
     ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
-    ctx.set_visuals_of(egui::Theme::Dark, dark_visuals());
-    ctx.set_visuals_of(egui::Theme::Light, light_visuals());
+    ctx.set_visuals_of(egui::Theme::Dark, visuals(&DARK, true));
+    ctx.set_visuals_of(egui::Theme::Light, visuals(&LIGHT, false));
     ctx.all_styles_mut(|style| {
-        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        style.spacing.button_padding = Vec2::new(12.0, 5.0);
+        style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+        style.spacing.button_padding = Vec2::new(12.0, 6.0);
         style.spacing.interact_size.y = 28.0;
         style.spacing.menu_margin = egui::Margin::same(8);
+        for (text_style, font) in style.text_styles.iter_mut() {
+            font.size = match text_style {
+                egui::TextStyle::Small => 12.0,
+                egui::TextStyle::Heading => 22.0,
+                _ => 14.0,
+            };
+        }
     });
 }
 
-fn dark_visuals() -> Visuals {
-    let mut v = Visuals::dark();
-    let bg = Color32::from_rgb(34, 37, 43);
-    v.panel_fill = bg;
-    v.window_fill = Color32::from_rgb(40, 43, 50);
-    v.extreme_bg_color = Color32::from_rgb(26, 28, 32);
-    v.faint_bg_color = Color32::from_rgb(40, 43, 50);
-    v.code_bg_color = Color32::from_rgb(26, 28, 32);
-    v.window_stroke = Stroke::new(1.0, card_border(true));
-    v.selection.bg_fill = BLUE;
-    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
-    v.hyperlink_color = BLUE_HOVER;
-    common(&mut v, true);
-    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(48, 52, 60);
-    v.widgets.inactive.bg_fill = Color32::from_rgb(48, 52, 60);
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(60, 65, 74);
-    v.widgets.hovered.bg_fill = Color32::from_rgb(60, 65, 74);
-    v.widgets.active.weak_bg_fill = Color32::from_rgb(70, 76, 86);
-    v
-}
-
-fn light_visuals() -> Visuals {
-    let mut v = Visuals::light();
-    v.panel_fill = Color32::from_rgb(246, 247, 249);
-    v.window_fill = Color32::WHITE;
-    v.extreme_bg_color = Color32::WHITE;
-    v.faint_bg_color = Color32::from_rgb(240, 242, 245);
-    v.window_stroke = Stroke::new(1.0, card_border(false));
-    v.selection.bg_fill = BLUE;
-    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
-    v.hyperlink_color = BLUE_ACTIVE;
-    common(&mut v, false);
-    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(228, 231, 236);
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(216, 220, 227);
-    v
-}
-
-fn common(v: &mut Visuals, _dark: bool) {
-    let r = CornerRadius::same(6);
-    v.widgets.noninteractive.corner_radius = r;
-    v.widgets.inactive.corner_radius = r;
-    v.widgets.hovered.corner_radius = r;
-    v.widgets.active.corner_radius = r;
-    v.widgets.open.corner_radius = r;
+/// Same widget look as termker.
+fn visuals(p: &Palette, dark: bool) -> Visuals {
+    let mut v = if dark { Visuals::dark() } else { Visuals::light() };
+    let radius = CornerRadius::same(6);
+    v.override_text_color = Some(p.text);
+    v.weak_text_color = Some(p.text_dim);
+    v.panel_fill = p.bg;
+    v.window_fill = p.panel;
+    v.window_stroke = Stroke::new(1.0, p.border);
     v.window_corner_radius = CornerRadius::same(10);
     v.menu_corner_radius = CornerRadius::same(8);
-    v.widgets.hovered.bg_stroke = Stroke::NONE;
-    v.widgets.inactive.bg_stroke = Stroke::NONE;
+    v.extreme_bg_color = p.surface;
+    v.faint_bg_color = p.surface;
+    v.code_bg_color = p.surface;
+    v.hyperlink_color = p.accent_text;
+    v.selection.bg_fill = p.accent.gamma_multiply(0.35);
+    v.selection.stroke = Stroke::new(1.0, p.accent_text);
+    v.warn_fg_color = p.danger;
+    v.error_fg_color = p.danger;
+
+    let w = &mut v.widgets;
+    w.noninteractive.bg_fill = p.panel;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
+    w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
+    w.noninteractive.corner_radius = radius;
+
+    w.inactive.bg_fill = p.surface;
+    w.inactive.weak_bg_fill = p.surface;
+    w.inactive.bg_stroke = Stroke::new(1.0, p.border);
+    w.inactive.fg_stroke = Stroke::new(1.0, p.text);
+    w.inactive.corner_radius = radius;
+
+    w.hovered.bg_fill = p.accent.gamma_multiply(0.18);
+    w.hovered.weak_bg_fill = p.accent.gamma_multiply(0.18);
+    w.hovered.bg_stroke = Stroke::new(1.0, p.accent_text);
+    w.hovered.fg_stroke = Stroke::new(1.5, p.text);
+    w.hovered.corner_radius = radius;
+
+    w.active.bg_fill = p.accent.gamma_multiply(0.3);
+    w.active.weak_bg_fill = p.accent.gamma_multiply(0.3);
+    w.active.bg_stroke = Stroke::new(1.0, p.accent_text);
+    w.active.fg_stroke = Stroke::new(2.0, p.text);
+    w.active.corner_radius = radius;
+
+    w.open = w.hovered;
+    v
 }
 
-/// Run `add` with button colours switched to the blue accent.
+/// Page title with a short description under it (termker's page header).
+pub fn page_header(ui: &mut Ui, title: &str, subtitle: &str) {
+    ui.label(RichText::new(title).size(24.0).strong());
+    if !subtitle.is_empty() {
+        ui.label(RichText::new(subtitle).weak());
+    }
+    ui.add_space(12.0);
+}
+
+/// Section title with a small description, as on termker's Settings page.
+pub fn section(ui: &mut Ui, title: &str, description: &str) {
+    ui.label(RichText::new(title).strong());
+    if !description.is_empty() {
+        ui.add(egui::Label::new(RichText::new(description).small().weak()).wrap());
+    }
+    ui.add_space(4.0);
+}
+
+/// Run `add` with button colours switched to the accent fill.
 pub fn blue_scope<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.scope(|ui| {
+        let p = pal(ui);
         let w = &mut ui.visuals_mut().widgets;
-        for (state, fill) in [
-            (&mut w.inactive, BLUE),
-            (&mut w.hovered, BLUE_HOVER),
-            (&mut w.active, BLUE_ACTIVE),
+        for (state, fill, stroke) in [
+            (&mut w.inactive, p.accent, Stroke::NONE),
+            (&mut w.hovered, p.accent, Stroke::new(1.0, p.accent_text)),
+            (&mut w.active, p.accent.linear_multiply(0.85), Stroke::new(1.0, p.accent_text)),
         ] {
             state.weak_bg_fill = fill;
             state.bg_fill = fill;
             state.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-            state.bg_stroke = Stroke::NONE;
+            state.bg_stroke = stroke;
         }
         add(ui)
     })
@@ -137,13 +189,13 @@ pub fn blue_scope<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 /// The default action button: solid blue.
 pub fn primary(ui: &mut Ui, text: impl Into<String>) -> Response {
     let text = text.into();
-    blue_scope(ui, |ui| ui.button(RichText::new(text).color(Color32::WHITE)))
+    blue_scope(ui, |ui| ui.button(RichText::new(text).color(Color32::WHITE).strong()))
 }
 
 pub fn primary_enabled(ui: &mut Ui, enabled: bool, text: impl Into<String>) -> Response {
     let text = text.into();
     blue_scope(ui, |ui| {
-        ui.add_enabled(enabled, egui::Button::new(RichText::new(text).color(Color32::WHITE)))
+        ui.add_enabled(enabled, egui::Button::new(RichText::new(text).color(Color32::WHITE).strong()))
     })
 }
 
@@ -159,41 +211,35 @@ pub fn primary_wide(ui: &mut Ui, enabled: bool, text: impl Into<String>, height:
     })
 }
 
-/// A sidebar navigation item: blue when selected, subtle hover otherwise.
+/// A sidebar navigation item, like termker's: full width, 34 px, accent fill
+/// with white bold text when selected, a light hover otherwise.
 pub fn nav_item(ui: &mut Ui, selected: bool, text: &str, badge: Option<usize>) -> Response {
-    let size = Vec2::new(ui.available_width(), 32.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let visuals = ui.visuals();
-    let fill = if selected {
-        BLUE
-    } else if resp.hovered() {
-        visuals.widgets.hovered.weak_bg_fill
+    let p = pal(ui);
+    let label = if selected {
+        RichText::new(text).color(Color32::WHITE).strong()
     } else {
-        Color32::TRANSPARENT
+        RichText::new(text)
     };
-    let text_color = if selected { Color32::WHITE } else { visuals.text_color() };
-    let painter = ui.painter();
-    painter.rect_filled(rect, 6.0, fill);
-    painter.text(
-        rect.left_center() + Vec2::new(12.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        text,
-        FontId::proportional(14.5),
-        text_color,
-    );
+    let mut button = egui::Button::new(label).min_size(Vec2::new(ui.available_width(), 34.0)).frame_when_inactive(false);
+    if selected {
+        button = button.fill(p.accent).frame_when_inactive(true);
+    }
+    let resp = ui.add(button);
     if let Some(n) = badge.filter(|n| *n > 0) {
         let label = n.to_string();
         let w = 10.0 + 7.0 * label.len() as f32;
+        let rect = resp.rect;
         let badge_rect = Rect::from_center_size(rect.right_center() - Vec2::new(10.0 + w / 2.0, 0.0), Vec2::new(w, 18.0));
         let (bg, fg) = if selected {
             (Color32::from_white_alpha(60), Color32::WHITE)
         } else {
-            (BLUE, Color32::WHITE)
+            (p.accent, Color32::WHITE)
         };
+        let painter = ui.painter();
         painter.rect_filled(badge_rect, 9.0, bg);
         painter.text(badge_rect.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(11.5), fg);
     }
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    resp
 }
 
 /// Gitsot's logo: a small branch diagram (two lanes joining) in a rounded square.
@@ -224,14 +270,71 @@ pub fn logo(ui: &mut Ui, size: f32) -> Response {
     resp
 }
 
-/// A rounded "card" frame.
+/// Card frame: `surface` background with a thin border (termker's card).
 pub fn card_frame(ui: &Ui, highlighted: bool) -> egui::Frame {
-    let dark = ui.visuals().dark_mode;
+    let p = pal(ui);
     egui::Frame::new()
-        .fill(card_bg(dark))
-        .stroke(Stroke::new(if highlighted { 1.5 } else { 1.0 }, if highlighted { BLUE } else { card_border(dark) }))
-        .corner_radius(CornerRadius::same(10))
+        .fill(p.surface)
+        .stroke(Stroke::new(if highlighted { 1.5 } else { 1.0 }, if highlighted { p.accent_text } else { p.border }))
+        .corner_radius(CornerRadius::same(8))
         .inner_margin(egui::Margin::same(14))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Icon {
+    Rename,
+    Delete,
+}
+
+/// A small square button with a drawn icon (pencil or bin), as in termker.
+/// The name is shown when the pointer rests on it.
+pub fn icon_button(ui: &mut Ui, icon: Icon, name: &str) -> Response {
+    let p = pal(ui);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(26.0, 26.0), Sense::click());
+    let hovered = response.hovered();
+    let color = match (icon, hovered) {
+        (Icon::Delete, true) => p.danger,
+        (_, true) => p.text,
+        (_, false) => p.text_dim,
+    };
+    let painter = ui.painter();
+    if hovered {
+        painter.rect_filled(rect, 6.0, p.border);
+    }
+    let stroke = Stroke::new(1.4, color);
+    let c = rect.center();
+    let at = |x: f32, y: f32| c + Vec2::new(x, y);
+    match icon {
+        Icon::Rename => {
+            painter.add(egui::Shape::closed_line(vec![at(2.5, -6.5), at(6.5, -2.5), at(-2.5, 6.5), at(-6.5, 2.5)], stroke));
+            painter.add(egui::Shape::convex_polygon(vec![at(-6.5, 2.5), at(-2.5, 6.5), at(-7.0, 7.0)], color, stroke));
+            painter.line_segment([at(0.0, -4.0), at(4.0, 0.0)], stroke);
+        }
+        Icon::Delete => {
+            painter.line_segment([at(-6.5, -4.0), at(6.5, -4.0)], stroke);
+            painter.line_segment([at(-2.0, -6.5), at(2.0, -6.5)], stroke);
+            painter.line_segment([at(-2.0, -6.5), at(-2.0, -4.0)], stroke);
+            painter.line_segment([at(2.0, -6.5), at(2.0, -4.0)], stroke);
+            painter.add(egui::Shape::line(vec![at(-5.0, -4.0), at(-4.0, 7.0), at(4.0, 7.0), at(5.0, -4.0)], stroke));
+            painter.line_segment([at(-1.5, -1.0), at(-1.5, 4.0)], stroke);
+            painter.line_segment([at(1.5, -1.0), at(1.5, 4.0)], stroke);
+        }
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(name)
+}
+
+/// The open/close arrow of a group header.
+pub fn fold_arrow(ui: &mut Ui, collapsed: bool) -> Response {
+    let p = pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(14.0, 20.0), Sense::click());
+    let c = rect.center();
+    let points = if collapsed {
+        vec![c + Vec2::new(-3.0, -5.0), c + Vec2::new(4.0, 0.0), c + Vec2::new(-3.0, 5.0)]
+    } else {
+        vec![c + Vec2::new(-5.0, -3.0), c + Vec2::new(5.0, -3.0), c + Vec2::new(0.0, 4.0)]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(points, p.text_dim, Stroke::NONE));
+    resp
 }
 
 /// Pixels for the window icon (the logo rendered at `size`).
