@@ -766,6 +766,15 @@ pub fn delete_branch(repo: &Repository, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Is every commit of local branch `name` already in the current branch?
+pub fn branch_merged(repo: &Repository, name: &str) -> bool {
+    let Ok(b) = repo.find_branch(name, BranchType::Local) else { return false };
+    let (Some(tip), Some(head)) = (b.get().target(), repo.head().ok().and_then(|h| h.target())) else {
+        return false;
+    };
+    tip == head || repo.graph_descendant_of(head, tip).unwrap_or(false)
+}
+
 pub fn remote_url(repo: &Repository) -> Option<String> {
     let name = default_remote(repo)?;
     let remote = repo.find_remote(&name).ok()?;
