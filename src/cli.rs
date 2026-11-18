@@ -14,6 +14,12 @@ pub enum NetOp {
     Fetch,
     Pull,
     Push { set_upstream: Option<(String, String)> },
+    /// Delete `branch` on `remote` (`git push <remote> --delete <branch>`).
+    DeleteRemoteBranch { remote: String, branch: String },
+    /// Merge `branch` into the current branch (`git merge --no-edit`).
+    Merge { branch: String },
+    /// Stop a merge that has conflicts (`git merge --abort`).
+    MergeAbort,
 }
 
 impl NetOp {
@@ -23,6 +29,9 @@ impl NetOp {
             NetOp::Fetch => "fetch",
             NetOp::Pull => "pull",
             NetOp::Push { .. } => "push",
+            NetOp::DeleteRemoteBranch { .. } => "delete the branch",
+            NetOp::Merge { .. } => "merge",
+            NetOp::MergeAbort => "abort the merge",
         }
     }
 
@@ -32,6 +41,9 @@ impl NetOp {
             NetOp::Fetch => "Fetching",
             NetOp::Pull => "Pulling",
             NetOp::Push { .. } => "Pushing",
+            NetOp::DeleteRemoteBranch { .. } => "Deleting remote branch",
+            NetOp::Merge { .. } => "Merging",
+            NetOp::MergeAbort => "Aborting the merge",
         }
     }
 }
@@ -184,6 +196,9 @@ pub fn spawn(
                 Some((remote, branch)) => run(Some(&repo), &["push", "-u", remote, branch], c),
                 None => run(Some(&repo), &["push"], c),
             },
+            NetOp::DeleteRemoteBranch { remote, branch } => run(Some(&repo), &["push", remote, "--delete", branch], c),
+            NetOp::Merge { branch } => run(Some(&repo), &["merge", "--no-edit", branch], c),
+            NetOp::MergeAbort => run(Some(&repo), &["merge", "--abort"], c),
         };
         let auth_failed = matches!(&result, Err(e) if is_auth_error(e));
         let result = result.map_err(|e| friendly_error(&e));

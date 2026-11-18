@@ -279,7 +279,10 @@ enum Dialog {
     NewBranch { name: String },
     Identity { name: String, email: String, commit_after: bool },
     ConfirmDiscard { changes: Vec<FileChange> },
-    ConfirmDeleteBranch { name: String },
+    /// `remote` is set for a branch on a remote (`origin`, `feat/x`).
+    ConfirmDeleteBranch { name: String, remote: Option<String>, unmerged: bool },
+    /// Pick a branch to merge into the current one.
+    Merge { filter: String, selected: Option<String> },
     Message { title: String, text: String },
     SignIn { op: NetOp, host: String, username: String, password: String, retry: bool },
     /// About to commit or push with an identity that doesn't match the folder rule.
@@ -312,6 +315,8 @@ enum Action {
     ShowNewBranch,
     CreateBranch(String),
     AskDeleteBranch(String),
+    AskDeleteRemoteBranch(String),
+    ShowMerge(Option<String>),
     DeleteBranch(String),
     Net(NetOp),
     NetWithCredentials(NetOp, Credentials),
@@ -766,6 +771,10 @@ impl GitsotApp {
                             r.refresh()?;
                             return Ok(Some(format!("Switched to {local} (tracking {name})")));
                         }
+                        Action::ShowMerge(selected) => {
+                            self.dialog = Some(Dialog::Merge { filter: String::new(), selected });
+                            return Ok(None);
+                        }
                         Action::ShowNewBranch => {
                             self.dialog = Some(Dialog::NewBranch { name: String::new() });
                             return Ok(None);
@@ -777,7 +786,17 @@ impl GitsotApp {
                             return Ok(Some(format!("Created and switched to {}", name.trim())));
                         }
                         Action::AskDeleteBranch(name) => {
-                            self.dialog = Some(Dialog::ConfirmDeleteBranch { name });
+                            let unmerged = !git::branch_merged(&r.repo, &name);
+                            self.dialog = Some(Dialog::ConfirmDeleteBranch { name, remote: None, unmerged });
+                            return Ok(None);
+                        }
+                        Action::AskDeleteRemoteBranch(full) => {
+                            let Some((remote, branch)) = full.split_once('/') else { return Ok(None) };
+                            self.dialog = Some(Dialog::ConfirmDeleteBranch {
+                                name: branch.to_string(),
+                                remote: Some(remote.to_string()),
+                                unmerged: false,
+                            });
                             return Ok(None);
                         }
                         Action::DeleteBranch(name) => {
@@ -893,11 +912,20 @@ impl GitsotApp {
                     self.open_repo(&dest);
                     self.info(format!("Cloned into {}", dest.display()));
                 }
+                (NetOp::Merge { branch }, Ok(_)) => {
+                    let branch = branch.clone();
+                    self.refresh();
+                    let head = self.repo.as_ref().map(|r| r.head.display_name()).unwrap_or_default();
+                    self.info(format!("Merged {branch} into {head}"));
+                }
                 (op, Ok(_)) => {
                     let label = match op {
                         NetOp::Fetch => "Fetched from remote",
                         NetOp::Pull => "Pulled latest changes",
                         NetOp::Push { .. } => "Pushed to remote",
+                        NetOp::DeleteRemoteBranch { .. } => "Deleted the remote branch",
+                        NetOp::Merge { .. } => unreachable!(),
+                        NetOp::MergeAbort => "Merge aborted. Your branch is back to how it was.",
                         NetOp::Clone { .. } => unreachable!(),
                     };
                     let same_repo = self.repo.as_ref().map(|r| r.path == res.repo).unwrap_or(false);
@@ -917,6 +945,20 @@ impl GitsotApp {
                         username: if retry { self.last_username.clone() } else { String::new() },
                         password: String::new(),
                         retry,
+                    });
+                }
+                (NetOp::Merge { branch }, Err(e)) if self.repo.as_ref().is_some_and(|r| r.repo.state() == git2::RepositoryState::Merge) => {
+                    let branch = branch.clone();
+                    self.refresh();
+                    self.page = Page::Changes;
+                    self.dialog = Some(Dialog::Message {
+                        title: "The merge has conflicts".into(),
+                        text: format!(
+                            "Some files were changed on both sides, so {branch} could not be merged automatically.\n\n\
+                             They are marked ! in Changes. Open each one in your editor, choose what to keep \
+                             (remove the <<<<<<< ======= >>>>>>> lines), tick it, then commit to finish the merge.\n\n\
+                             To give up instead, use Abort merge at the top of Changes.\n\n{e}"
+                        ),
                     });
                 }
                 (op, Err(e)) => {
@@ -1325,6 +1367,15 @@ impl GitsotApp {
                         .response
                         .on_hover_text("Current branch: switch or create branches");
                         ui.menu_button("☰", |ui| {
+                            if ui.button(format!("Merge into {}…", r.head.display_name())).clicked() {
+                                actions.push(Action::ShowMerge(None));
+                                ui.close();
+                            }
+                            if r.repo.state() == git2::RepositoryState::Merge && ui.button("Abort merge").clicked() {
+                                actions.push(Action::Net(NetOp::MergeAbort));
+                                ui.close();
+                            }
+                            ui.separator();
                             if ui.button("Refresh (F5)").clicked() {
                                 actions.push(Action::Refresh);
                                 ui.close();
@@ -1671,14 +1722,77 @@ impl GitsotApp {
                         }
                     });
                 }
-                Dialog::ConfirmDeleteBranch { name } => {
-                    ui.heading("Delete branch?");
+                Dialog::Merge { filter, selected } => {
+                    let Some(r) = self.repo.as_ref() else {
+                        close = true;
+                        return;
+                    };
+                    let current = r.head.display_name();
+                    ui.heading(format!("Merge into {current}"));
                     ui.add_space(4.0);
-                    ui.label(format!("The local branch '{name}' will be deleted. Commits that only exist on it may be lost."));
+                    ui.label(RichText::new("Pick the branch whose changes you want to bring into your current branch.").weak());
+                    ui.add_space(6.0);
+                    ui.add(TextEdit::singleline(filter).hint_text("Filter branches").desired_width(380.0));
+                    let f = filter.to_lowercase();
+                    let local = r.branches.iter().filter(|b| !b.is_head).map(|b| b.name.clone());
+                    let remote = r.remote_branches.iter().cloned();
+                    let names: Vec<String> = local.chain(remote).filter(|n| n.to_lowercase().contains(&f)).collect();
+                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        ui.set_min_width(380.0);
+                        if names.is_empty() {
+                            ui.label(RichText::new("No other branches.").weak());
+                        }
+                        for n in names {
+                            let is_sel = selected.as_deref() == Some(n.as_str());
+                            if ui.add(egui::Button::selectable(is_sel, n.as_str()).truncate()).clicked() {
+                                *selected = Some(n);
+                            }
+                        }
+                    });
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button(RichText::new("Delete").color(Color32::from_rgb(229, 83, 75))).clicked() {
-                            actions.push(Action::DeleteBranch(name.clone()));
+                        let label = match selected {
+                            Some(b) => format!("Merge {b} into {current}"),
+                            None => "Merge".to_string(),
+                        };
+                        if theme::primary_enabled(ui, selected.is_some(), label).clicked() {
+                            if let Some(b) = selected.clone() {
+                                actions.push(Action::Net(NetOp::Merge { branch: b }));
+                            }
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::ConfirmDeleteBranch { name, remote, unmerged } => {
+                    ui.heading("Delete branch?");
+                    ui.add_space(4.0);
+                    match remote {
+                        Some(remote) => {
+                            ui.label(format!("The branch '{name}' will be deleted from {remote}, for everyone who uses it."));
+                            ui.label(RichText::new("Your local branches are not touched.").weak());
+                        }
+                        None => {
+                            ui.label(format!("The local branch '{name}' will be deleted from this computer."));
+                            if *unmerged {
+                                ui.label(
+                                    RichText::new("It has commits that are not in your current branch. They will be lost unless they were pushed.")
+                                        .color(theme::ORANGE),
+                                );
+                            } else {
+                                ui.label(RichText::new("All its commits are already in your current branch.").weak());
+                            }
+                        }
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Delete").color(theme::RED)).clicked() {
+                            actions.push(match remote {
+                                Some(remote) => Action::Net(NetOp::DeleteRemoteBranch { remote: remote.clone(), branch: name.clone() }),
+                                None => Action::DeleteBranch(name.clone()),
+                            });
                             close = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -2087,37 +2201,46 @@ fn about_page(ui: &mut egui::Ui) {
 }
 
 fn branch_menu(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
-    ui.set_min_width(300.0);
+    ui.set_min_width(320.0);
+    ui.set_max_width(320.0);
     if ui.button("✚  New branch…").clicked() {
         actions.push(Action::ShowNewBranch);
         ui.close();
     }
+    if ui.button(format!("⤵  Merge into {}…", r.head.display_name())).clicked() {
+        actions.push(Action::ShowMerge(None));
+        ui.close();
+    }
     ui.separator();
-    ui.add(TextEdit::singleline(&mut r.branch_filter).hint_text("Filter branches").desired_width(280.0));
+    ui.add(TextEdit::singleline(&mut r.branch_filter).hint_text("Filter branches").desired_width(f32::INFINITY));
     let filter = r.branch_filter.to_lowercase();
 
     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
         ui.label(RichText::new("Local branches").small().weak());
         for b in r.branches.iter().filter(|b| b.name.to_lowercase().contains(&filter)) {
             ui.horizontal(|ui| {
-                let label = if b.is_head { format!("✔ {}", b.name) } else { b.name.clone() };
-                let resp = ui.add(egui::Button::selectable(b.is_head, label));
-                let resp = match &b.upstream {
-                    Some(u) => resp.on_hover_text(format!("Tracks {u}")),
-                    None => resp.on_hover_text("Not published yet"),
-                };
-                if resp.clicked() && !b.is_head {
-                    actions.push(Action::Checkout(b.name.clone()));
-                    ui.close();
-                }
-                if !b.is_head {
-                    resp.context_menu(|ui| {
-                        if ui.button("Delete branch…").clicked() {
-                            actions.push(Action::AskDeleteBranch(b.name.clone()));
+                // The delete icon goes on the right; the current branch can't be deleted.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if b.is_head {
+                        ui.add_space(26.0);
+                    } else if theme::icon_button(ui, theme::Icon::Delete, "Delete this branch…").clicked() {
+                        actions.push(Action::AskDeleteBranch(b.name.clone()));
+                        ui.close();
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        let label = if b.is_head { format!("✔ {}", b.name) } else { b.name.clone() };
+                        let resp = ui.add(egui::Button::selectable(b.is_head, label).truncate());
+                        let resp = match (&b.upstream, b.is_head) {
+                            (_, true) => resp.on_hover_text("The branch you are on (switch to another branch to delete it)"),
+                            (Some(u), _) => resp.on_hover_text(format!("Tracks {u}")),
+                            (None, _) => resp.on_hover_text("Not published yet"),
+                        };
+                        if resp.clicked() && !b.is_head {
+                            actions.push(Action::Checkout(b.name.clone()));
                             ui.close();
                         }
                     });
-                }
+                });
             });
         }
 
@@ -2136,21 +2259,47 @@ fn branch_menu(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
             ui.add_space(6.0);
             ui.label(RichText::new("Remote branches").small().weak());
             for n in remote {
-                if ui
-                    .add(egui::Button::selectable(false, n.as_str()))
-                    .on_hover_text("Check out as a new local branch")
-                    .clicked()
-                {
-                    actions.push(Action::CheckoutRemote(n.clone()));
-                    ui.close();
-                }
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::icon_button(ui, theme::Icon::Delete, "Delete this branch from the remote…").clicked() {
+                            actions.push(Action::AskDeleteRemoteBranch(n.clone()));
+                            ui.close();
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            if ui
+                                .add(egui::Button::selectable(false, n.as_str()).truncate())
+                                .on_hover_text("Check out as a new local branch")
+                                .clicked()
+                            {
+                                actions.push(Action::CheckoutRemote(n.clone()));
+                                ui.close();
+                            }
+                        });
+                    });
+                });
             }
         }
     });
-    ui.label(RichText::new("Tip: right-click a branch to delete it.").small().weak());
+    ui.label(RichText::new("Click a branch to switch to it. Use the bin icon to delete one.").small().weak());
 }
 
 fn changes_sidebar(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
+    if r.repo.state() == git2::RepositoryState::Merge {
+        egui::Panel::top("merge_banner").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Abort merge").on_hover_text("Undo the merge and go back to how your branch was").clicked() {
+                        actions.push(Action::Net(NetOp::MergeAbort));
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new("Merging: fix the ! files, tick them, then commit").color(theme::ORANGE)).wrap());
+                    });
+                });
+            });
+            ui.add_space(2.0);
+        });
+    }
     // Commit box at the bottom of the sidebar.
     egui::Panel::bottom("commit_box").show(ui, |ui| {
         ui.add_space(6.0);

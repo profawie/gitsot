@@ -10,7 +10,7 @@ Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](ht
 - **Changes**: see every changed file, tick the ones to include (stage), untick to unstage, and view a coloured diff.
 - **Commit**: summary + description, then *Commit to &lt;branch&gt;* (or <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>Enter</kbd>). If your Git name/email are not set, Gitsot asks for them once.
 - **Discard**: right-click a file (or *Discard all…*) to throw away changes, with a confirmation.
-- **Branches**: switch, create, delete (right-click), and check out remote branches.
+- **Branches**: switch, create, check out remote branches, and **merge** another branch into the current one (branch menu → *Merge into …*). If a merge has conflicts, the files are marked `!` in Changes; fix them and commit, or *Abort merge*. Delete local or remote branches with the bin icon in the branch menu (never the branch you are on).
 - **Remote**: Fetch, Pull and Push, with ahead/behind counts. New branches get a *Publish branch* button.
 - **History**: switch between a **Tree** view (the default) (coloured branch graph with branch, remote and tag labels) and a simple **List**, and see each commit's files and diffs.
 - Sidebar navigation, Settings and About pages, light and dark theme, auto-refresh when the window regains focus, <kbd>F5</kbd> to refresh.
