@@ -9,7 +9,7 @@ use eframe::egui::{
 use git2::{Oid, Repository};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::{self, NetOp, NetResult};
+use crate::cli::{self, Credentials, NetOp, NetResult};
 use crate::git::{self, BranchInfo, ChangeKind, CommitFile, CommitInfo, FileChange, FileDiff, HeadInfo, LineKind};
 
 const SETTINGS_KEY: &str = "gitsot-settings";
@@ -191,6 +191,7 @@ enum Dialog {
     ConfirmDiscard { changes: Vec<FileChange> },
     ConfirmDeleteBranch { name: String },
     Message { title: String, text: String },
+    SignIn { op: NetOp, host: String, username: String, password: String, retry: bool },
 }
 
 /// Things the user asked for while drawing the UI; applied afterwards so we
@@ -218,6 +219,7 @@ enum Action {
     AskDeleteBranch(String),
     DeleteBranch(String),
     Net(NetOp),
+    NetWithCredentials(NetOp, Credentials),
     StartClone { url: String, parent: String, name: String },
     LoadHistory,
     SelectCommit(Oid),
@@ -245,6 +247,8 @@ pub struct GitsotApp {
     rx: Receiver<NetResult>,
     git_cli: bool,
     was_focused: bool,
+    /// Username typed into the last sign-in dialog, to pre-fill a retry.
+    last_username: String,
 }
 
 impl GitsotApp {
@@ -265,6 +269,7 @@ impl GitsotApp {
             rx,
             git_cli: cli::git_available(),
             was_focused: true,
+            last_username: String::new(),
         };
         app.apply_theme(&cc.egui_ctx);
         configure_style(&cc.egui_ctx);
@@ -386,7 +391,12 @@ impl GitsotApp {
                 self.info("Copied to clipboard");
             }
             Action::StartClone { url, parent, name } => self.start_clone(ctx, url, parent, name),
-            Action::Net(op) => self.start_net(ctx, op),
+            Action::Net(op) => self.start_net(ctx, op, None),
+            Action::NetWithCredentials(op, creds) => {
+                self.dialog = None;
+                self.last_username = creds.username.clone();
+                self.start_net(ctx, op, Some(creds));
+            }
             Action::SetIdentity { name, email, commit_after } => {
                 if name.trim().is_empty() || email.trim().is_empty() {
                     self.error("Please enter both a name and an email");
@@ -538,10 +548,10 @@ impl GitsotApp {
         }
         self.settings.clone_parent = Some(parent);
         self.dialog = None;
-        self.start_net(ctx, NetOp::Clone { url, dest });
+        self.start_net(ctx, NetOp::Clone { url, dest }, None);
     }
 
-    fn start_net(&mut self, ctx: &egui::Context, op: NetOp) {
+    fn start_net(&mut self, ctx: &egui::Context, op: NetOp, creds: Option<Credentials>) {
         if self.busy.is_some() {
             return;
         }
@@ -567,7 +577,7 @@ impl GitsotApp {
             _ => format!("{}…", op.label()),
         };
         self.busy = Some(detail);
-        cli::spawn(op, repo_path, self.tx.clone(), ctx.clone());
+        cli::spawn(op, repo_path, creds, self.tx.clone(), ctx.clone());
     }
 
     fn poll_background(&mut self) {
@@ -592,12 +602,33 @@ impl GitsotApp {
                     }
                     self.info(label);
                 }
+                (op, Err(_)) if res.auth_failed && self.remote_url_for(op).is_some_and(|u| cli::is_http_url(&u)) => {
+                    // The remote needs a sign-in. Ask for it ourselves, the same way for
+                    // every Git host, instead of letting a helper open its own window.
+                    let retry = res.used_credentials;
+                    let host = self.remote_url_for(op).map(|u| cli::host_of(&u)).unwrap_or_default();
+                    self.dialog = Some(Dialog::SignIn {
+                        op: op.clone(),
+                        host,
+                        username: if retry { self.last_username.clone() } else { String::new() },
+                        password: String::new(),
+                        retry,
+                    });
+                }
                 (op, Err(e)) => {
                     let title = format!("{} failed", op.label());
                     self.dialog = Some(Dialog::Message { title, text: e });
                     self.refresh();
                 }
             }
+        }
+    }
+
+    /// The URL a network operation talks to.
+    fn remote_url_for(&self, op: &NetOp) -> Option<String> {
+        match op {
+            NetOp::Clone { url, .. } => Some(url.clone()),
+            _ => self.repo.as_ref().and_then(|r| r.remote_url.clone()),
         }
     }
 
@@ -1153,6 +1184,50 @@ impl GitsotApp {
                         if ui.button(RichText::new("Delete").color(Color32::from_rgb(229, 83, 75))).clicked() {
                             actions.push(Action::DeleteBranch(name.clone()));
                             close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::SignIn { op, host, username, password, retry } => {
+                    ui.heading(format!("Sign in to {host}"));
+                    ui.add_space(4.0);
+                    if *retry {
+                        ui.label(
+                            RichText::new("That didn't work. Check your username and password or token.")
+                                .color(Color32::from_rgb(229, 83, 75)),
+                        );
+                    }
+                    ui.label("This remote needs a username and password to continue.");
+                    ui.add_space(8.0);
+                    ui.label("Username");
+                    let user_resp = ui.add(TextEdit::singleline(username).desired_width(f32::INFINITY));
+                    if username.is_empty() && password.is_empty() && !user_resp.has_focus() {
+                        user_resp.request_focus();
+                    }
+                    ui.label("Password or access token");
+                    let pass_resp = ui.add(TextEdit::singleline(password).password(true).desired_width(f32::INFINITY));
+                    ui.label(
+                        RichText::new(
+                            "Many hosts (GitHub, GitLab, Bitbucket, Gitea…) need a personal access token \
+                             instead of your account password. If Git has a credential store configured, \
+                             it will remember this sign-in.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let ok = !username.trim().is_empty() && !password.is_empty() && !busy;
+                        let enter = pass_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if ui.add_enabled(ok, egui::Button::new(format!("Sign in and {}", op.verb()))).clicked()
+                            || (enter && ok)
+                        {
+                            actions.push(Action::NetWithCredentials(
+                                op.clone(),
+                                Credentials { username: username.trim().to_string(), password: password.clone() },
+                            ));
                         }
                         if ui.button("Cancel").clicked() {
                             close = true;

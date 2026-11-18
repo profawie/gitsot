@@ -17,6 +17,15 @@ pub enum NetOp {
 }
 
 impl NetOp {
+    pub fn verb(&self) -> &'static str {
+        match self {
+            NetOp::Clone { .. } => "clone",
+            NetOp::Fetch => "fetch",
+            NetOp::Pull => "pull",
+            NetOp::Push { .. } => "push",
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             NetOp::Clone { .. } => "Cloning",
@@ -32,7 +41,25 @@ pub struct NetResult {
     /// The repository the operation ran in (or the clone destination).
     pub repo: PathBuf,
     pub result: Result<String, String>,
+    /// The remote asked for a username/password that nobody supplied.
+    pub auth_failed: bool,
+    /// Credentials from Gitsot's sign-in dialog were used for this attempt.
+    pub used_credentials: bool,
 }
+
+/// Username and password (or access token) typed into Gitsot's own sign-in dialog.
+#[derive(Clone)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// A credential helper that answers `get` with the values Gitsot passes in
+/// environment variables, so the secret never appears on a command line.
+/// It is added *after* the user's own helpers, so a saved credential still wins,
+/// and when the sign-in succeeds git asks those helpers to store it.
+const INLINE_HELPER: &str = "credential.helper=!f() { test \"$1\" = get && \
+printf 'username=%s\\npassword=%s\\n' \"$GITSOT_GIT_USERNAME\" \"$GITSOT_GIT_PASSWORD\"; }; f";
 
 /// Is a `git` executable available on PATH?
 pub fn git_available() -> bool {
@@ -45,8 +72,14 @@ fn command(cwd: Option<&Path>) -> Command {
         cmd.current_dir(dir);
     }
     // Never block waiting for a password on a terminal nobody can see.
-    // Graphical credential helpers (Git Credential Manager, keychain) still work.
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Never let a credential helper open its own window (for example Git Credential
+    // Manager's host-specific sign-in pages). Saved credentials are still used;
+    // when none exist Gitsot shows its own host-neutral sign-in dialog instead.
+    cmd.env("GCM_INTERACTIVE", "never");
+    cmd.env("GCM_GUI_PROMPT", "false");
+    cmd.env_remove("GIT_ASKPASS");
+    cmd.env_remove("SSH_ASKPASS");
     cmd.env("LC_ALL", "C");
     #[cfg(windows)]
     {
@@ -57,8 +90,14 @@ fn command(cwd: Option<&Path>) -> Command {
     cmd
 }
 
-fn run(cwd: Option<&Path>, args: &[&str]) -> Result<String, String> {
-    let output = command(cwd)
+fn run(cwd: Option<&Path>, args: &[&str], creds: Option<&Credentials>) -> Result<String, String> {
+    let mut cmd = command(cwd);
+    if let Some(c) = creds {
+        cmd.args(["-c", INLINE_HELPER]);
+        cmd.env("GITSOT_GIT_USERNAME", &c.username);
+        cmd.env("GITSOT_GIT_PASSWORD", &c.password);
+    }
+    let output = cmd
         .args(args)
         .output()
         .map_err(|e| format!("Could not run git: {e}. Is Git installed and on your PATH?"))?;
@@ -68,20 +107,46 @@ fn run(cwd: Option<&Path>, args: &[&str]) -> Result<String, String> {
     if output.status.success() {
         Ok(text)
     } else {
-        Err(friendly_error(&text))
+        Err(text)
     }
 }
 
-fn friendly_error(text: &str) -> String {
+/// Did git fail because the remote wants a username/password we could not supply?
+pub fn is_auth_error(text: &str) -> bool {
     let lower = text.to_lowercase();
-    let hint = if lower.contains("terminal prompts disabled")
-        || lower.contains("authentication failed")
-        || lower.contains("could not read username")
-    {
-        Some(
-            "Authentication is needed. Set up a credential helper (for example Git Credential \
-             Manager on Windows, or the keychain on macOS), or use an SSH remote URL.",
-        )
+    [
+        "terminal prompts disabled",
+        "could not read username",
+        "could not read password",
+        "authentication failed",
+        "user interactivity has been disabled",
+        "invalid username or password",
+        "access denied",
+        "returned error: 401",
+        "returned error: 403",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Is this an http(s) URL (where a username/password dialog makes sense)?
+pub fn is_http_url(url: &str) -> bool {
+    let u = url.trim().to_lowercase();
+    u.starts_with("https://") || u.starts_with("http://")
+}
+
+/// `https://user@host:443/path` -> `host`
+pub fn host_of(url: &str) -> String {
+    let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    host.split(':').next().unwrap_or(host).to_string()
+}
+
+pub fn friendly_error(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let hint = if is_auth_error(text) {
+        Some("The remote rejected the sign-in. Check your username and password or access token.")
     } else if lower.contains("permission denied (publickey)") {
         Some("Your SSH key was rejected. Check that it is added to your Git host and ssh-agent.")
     } else if lower.contains("non-fast-forward") || lower.contains("fetch first") {
@@ -99,21 +164,31 @@ fn friendly_error(text: &str) -> String {
 }
 
 /// Run a network operation on a background thread and send the result back.
-pub fn spawn(op: NetOp, repo: PathBuf, tx: Sender<NetResult>, ctx: eframe::egui::Context) {
+pub fn spawn(
+    op: NetOp,
+    repo: PathBuf,
+    creds: Option<Credentials>,
+    tx: Sender<NetResult>,
+    ctx: eframe::egui::Context,
+) {
     std::thread::spawn(move || {
+        let c = creds.as_ref();
         let result = match &op {
             NetOp::Clone { url, dest } => {
                 let dest_s = dest.to_string_lossy().to_string();
-                run(None, &["clone", "--progress", url, &dest_s])
+                run(None, &["clone", "--progress", url, &dest_s], c)
             }
-            NetOp::Fetch => run(Some(&repo), &["fetch", "--all", "--prune"]),
-            NetOp::Pull => run(Some(&repo), &["pull", "--no-rebase", "--no-edit"]),
+            NetOp::Fetch => run(Some(&repo), &["fetch", "--all", "--prune"], c),
+            NetOp::Pull => run(Some(&repo), &["pull", "--no-rebase", "--no-edit"], c),
             NetOp::Push { set_upstream } => match set_upstream {
-                Some((remote, branch)) => run(Some(&repo), &["push", "-u", remote, branch]),
-                None => run(Some(&repo), &["push"]),
+                Some((remote, branch)) => run(Some(&repo), &["push", "-u", remote, branch], c),
+                None => run(Some(&repo), &["push"], c),
             },
         };
-        let _ = tx.send(NetResult { op, repo, result });
+        let auth_failed = matches!(&result, Err(e) if is_auth_error(e));
+        let result = result.map_err(|e| friendly_error(&e));
+        let used_credentials = creds.is_some();
+        let _ = tx.send(NetResult { op, repo, result, auth_failed, used_credentials });
         ctx.request_repaint();
     });
 }
@@ -139,5 +214,16 @@ mod tests {
         assert_eq!(name_from_url("https://github.com/profawie/gitsot/"), "gitsot");
         assert_eq!(name_from_url("git@github.com:profawie/gitsot.git"), "gitsot");
         assert_eq!(name_from_url("gitsot"), "gitsot");
+    }
+
+    #[test]
+    fn hosts_and_auth_errors() {
+        assert_eq!(host_of("https://gitlab.example.com:8443/a/b.git"), "gitlab.example.com");
+        assert_eq!(host_of("https://me@bitbucket.org/a/b.git"), "bitbucket.org");
+        assert!(is_http_url("HTTPS://x/y"));
+        assert!(!is_http_url("git@github.com:a/b.git"));
+        assert!(is_auth_error("fatal: could not read Username for 'https://x': terminal prompts disabled"));
+        assert!(is_auth_error("fatal: Authentication failed for 'https://x/'"));
+        assert!(!is_auth_error("fatal: not a git repository"));
     }
 }
