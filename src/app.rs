@@ -1359,15 +1359,16 @@ impl GitsotApp {
                 }
                 for rule in self.rules.clone() {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("📁").weak());
-                        ui.label(RichText::new(&rule.folder).strong());
-                        ui.label(RichText::new(format!("→ {}", rule.identity.display())).weak());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("Remove").clicked() {
-                                actions.push(Action::RemoveRule(rule.clone()));
-                            }
+                        if ui.small_button("Remove").clicked() {
+                            actions.push(Action::RemoveRule(rule.clone()));
+                        }
+                        ui.vertical(|ui| {
+                            ui.add(egui::Label::new(RichText::new(&rule.folder).strong()).truncate())
+                                .on_hover_text(&rule.folder);
+                            ui.label(RichText::new(format!("uses {}", rule.identity.display())).weak());
                         });
                     });
+                    ui.add_space(4.0);
                 }
                 ui.separator();
                 ui.label(RichText::new("Add a rule").small().strong());
