@@ -176,12 +176,13 @@ pub fn friendly_error(text: &str) -> String {
 }
 
 /// Run a network operation on a background thread and send the result back.
+/// `wake` is called after the result is sent, so the UI can redraw.
 pub fn spawn(
     op: NetOp,
     repo: PathBuf,
     creds: Option<Credentials>,
     tx: Sender<NetResult>,
-    ctx: eframe::egui::Context,
+    wake: impl FnOnce() + Send + 'static,
 ) {
     std::thread::spawn(move || {
         let c = creds.as_ref();
@@ -204,7 +205,7 @@ pub fn spawn(
         let result = result.map_err(|e| friendly_error(&e));
         let used_credentials = creds.is_some();
         let _ = tx.send(NetResult { op, repo, result, auth_failed, used_credentials });
-        ctx.request_repaint();
+        wake();
     });
 }
 

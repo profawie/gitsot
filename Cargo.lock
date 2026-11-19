@@ -896,14 +896,31 @@ dependencies = [
 name = "gitsot"
 version = "0.2.0"
 dependencies = [
+ "libloading",
+]
+
+[[package]]
+name = "gitsot-app"
+version = "0.2.0"
+dependencies = [
  "alacritty_terminal",
  "anyhow",
  "chrono",
  "eframe",
  "egui",
  "git2",
+ "gitsot-core",
  "rfd",
  "serde",
+]
+
+[[package]]
+name = "gitsot-core"
+version = "0.2.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "git2",
 ]
 
 [[package]]

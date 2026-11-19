@@ -1,0 +1,11 @@
+[package]
+name = "gitsot-core"
+description = "gitsot core: Git, identities, history graph and terminal logic (no UI)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+git2.workspace = true
+anyhow.workspace = true
+alacritty_terminal.workspace = true

@@ -155,7 +155,7 @@ const BASHRC: &str = r#"# Written by Gitsot. Loads your own .bashrc, then Gitsot
 /// starts with the plain shell).
 #[cfg(unix)]
 fn write_support_files() -> Option<std::path::PathBuf> {
-    let dir = eframe::storage_dir("gitsot")?.join("terminal");
+    let dir = crate::data_dir()?.join("terminal");
     std::fs::create_dir_all(dir.join("zsh")).ok()?;
     write_if_changed(&dir.join("prompt.sh"), PROMPT_SH)?;
     write_if_changed(&dir.join("bashrc"), BASHRC)?;

@@ -9,15 +9,16 @@ use eframe::egui::{
 use git2::{Oid, Repository};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::{self, Credentials, NetOp, NetResult};
-use crate::git::{
+use gitsot_core::cli::{self, Credentials, NetOp, NetResult};
+use gitsot_core::git::{
     self, BranchInfo, ChangeKind, CommitFile, CommitInfo, FileChange, FileDiff, HeadInfo, LineKind, RefKind,
     RefLabel,
 };
-use crate::graph::{self, Graph};
-use crate::identity::{self, FolderRule, Identity};
-use crate::term::Terminal;
-use crate::{shell, term_view, theme};
+use gitsot_core::graph::{self, Graph};
+use gitsot_core::identity::{self, FolderRule, Identity};
+use gitsot_core::term::Terminal;
+use crate::{term_view, theme};
+use gitsot_core::shell;
 use std::collections::HashMap;
 
 const SETTINGS_KEY: &str = "gitsot-settings";
@@ -941,7 +942,8 @@ impl GitsotApp {
             _ => format!("{}…", op.label()),
         };
         self.busy = Some(detail);
-        cli::spawn(op, repo_path, creds, self.tx.clone(), ctx.clone());
+        let ctx = ctx.clone();
+        cli::spawn(op, repo_path, creds, self.tx.clone(), move || ctx.request_repaint());
     }
 
     fn poll_background(&mut self) {

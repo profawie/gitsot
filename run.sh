@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Build (if needed) and start Gitsot on macOS or Linux.
+# Build gitsot (see build.sh) and start it on macOS or Linux.
 #
 #   ./run.sh                     open the last repository
 #   ./run.sh /path/to/repo       open a specific repository
 #   ./run.sh --debug [repo]      use a debug build
 set -euo pipefail
 
-FLAGS=(--release)
+BUILD_FLAGS=()
 if [ "${1:-}" = "--debug" ]; then
-  FLAGS=()
+  BUILD_FLAGS=(--debug)
   shift
 fi
 
@@ -23,4 +23,11 @@ if [ -n "${1:-}" ]; then
 fi
 
 cd "$(dirname "$0")"
-exec cargo run "${FLAGS[@]}" -- "${ARGS[@]+"${ARGS[@]}"}"
+./build.sh ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}
+
+if [ "$(uname -s)" = "Darwin" ]; then
+  EXE=dist/gitsot/gitsot.app/Contents/MacOS/gitsot
+else
+  EXE=dist/gitsot/gitsot
+fi
+exec "$EXE" ${ARGS[@]+"${ARGS[@]}"}

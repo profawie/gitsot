@@ -1,0 +1,13 @@
+[package]
+name = "gitsot"
+description = "gitsot launcher: a small executable that loads the gitsot library and starts it"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gitsot"
+path = "src/main.rs"
+
+[dependencies]
+libloading.workspace = true
