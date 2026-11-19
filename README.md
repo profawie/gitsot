@@ -76,7 +76,7 @@ Good to know:
 ### Windows (PowerShell)
 
 ```powershell
-.\build.ps1                     # release build -> dist\gitsot.exe
+.\build.ps1                     # release build -> dist\gitsot\
 .\build.ps1 -Dev                # debug build
 .\run.ps1                       # build and start
 .\run.ps1 C:\work\my-project    # build and open a specific repository
@@ -87,30 +87,54 @@ If PowerShell blocks the scripts, run once: `Set-ExecutionPolicy -Scope CurrentU
 ### macOS / Linux
 
 ```bash
-./build.sh                # release build -> dist/gitsot (and dist/gitsot.app on macOS)
+./build.sh                # release build -> dist/gitsot/
 ./build.sh --debug        # debug build
-./build.sh --windows      # cross-compile dist/gitsot.exe (needs mingw-w64)
+./build.sh --windows      # cross-compile for Windows -> dist/gitsot/ (needs mingw-w64)
 ./run.sh                  # build and start
 ./run.sh ~/code/project   # build and open a specific repository
 ```
 
-The Windows `.exe` is self-contained: no MinGW DLLs are needed at runtime.
+### The release folder
+
+Every build puts a ready-to-use release in `dist/gitsot`. It holds every file gitsot needs, so you can copy that one folder anywhere (another drive, another computer) and run gitsot from there:
+
+| Platform | Contents of `dist/gitsot` |
+| --- | --- |
+| Windows | `gitsot.exe` (the program you start) and `gitsot.dll` (the application) |
+| macOS | `gitsot.app`, with `libgitsot.dylib` inside `Contents/Frameworks` |
+| Linux | `gitsot` (the program you start) and `libgitsot.so` (the application) |
+
+Keep the files together: the program looks for the library in its own folder. On Windows no MinGW DLLs are normally needed, because Rust links them statically; if your MinGW setup does need some (for example `libwinpthread-1.dll`), `build.ps1` and `build.sh --windows` find them and copy them into the folder too.
 
 ## Project layout
 
+gitsot is a Cargo workspace with three crates, built the way desktop applications usually are: a small executable that loads one shared library.
+
+```
+gitsot.exe ──loads──▶ gitsot.dll ──contains──▶ gitsot-core
+(launcher)            (gitsot-app: the UI)     (Git, identities, terminal)
+```
+
+| Crate | Builds | What it does |
+| --- | --- | --- |
+| `crates/gitsot` | `gitsot.exe` / `gitsot` | The launcher. Finds the library next to itself, checks it is the same version, and starts it. Shows a message if the library is missing. |
+| `crates/gitsot-app` | `gitsot.dll` / `libgitsot.so` / `libgitsot.dylib` | The application: window and the whole UI. Exports `gitsot_main` and `gitsot_version` with a C interface. |
+| `crates/gitsot-core` | Rust library (linked into the dll) | Everything that is not UI. No dependency on the UI toolkit, so it can be tested on its own. |
+
 | File | What it does |
 | --- | --- |
-| `src/main.rs` | Window setup |
-| `src/app.rs` | All the UI: sidebar, repository cards, changes, history, settings, dialogs, diff viewer |
-| `src/theme.rs` | Colours, text sizes and widgets (same look as termker), logo, cards |
-| `src/graph.rs` | Lays out the history tree (lanes and branch lines) |
-| `src/git.rs` | Local Git operations with libgit2 (status, diff, stage, commit, branches, history) |
-| `src/identity.rs` | Global/repository identities, folder rules (`includeIf`) and mismatch checks |
-| `src/term.rs` | One built-in terminal: the shell in a pseudo-terminal and its screen (`alacritty_terminal`) |
-| `src/term_view.rs` | Draws the terminal, including the prompt's chips and icons, and handles keys and mouse |
-| `src/shell.rs` | Picks the shell (PowerShell / zsh / bash) and loads the Gitsot prompt into it |
-| `assets/prompt.ps1`, `assets/prompt.sh` | The Gitsot prompt for PowerShell and for zsh/bash |
-| `src/cli.rs` | Network operations through the `git` command, run in the background |
+| `crates/gitsot/src/main.rs` | The launcher |
+| `crates/gitsot-app/src/lib.rs` | Window setup and the exported entry points |
+| `crates/gitsot-app/src/app.rs` | All the UI: sidebar, repository cards, changes, history, settings, dialogs, diff viewer |
+| `crates/gitsot-app/src/theme.rs` | Colours, text sizes and widgets (same look as termker), logo, cards |
+| `crates/gitsot-app/src/term_view.rs` | Draws the terminal, including the prompt's chips and icons, and handles keys and mouse |
+| `crates/gitsot-core/src/git.rs` | Local Git operations with libgit2 (status, diff, stage, commit, branches, history) |
+| `crates/gitsot-core/src/identity.rs` | Global/repository identities, folder rules (`includeIf`) and mismatch checks |
+| `crates/gitsot-core/src/graph.rs` | Lays out the history tree (lanes and branch lines) |
+| `crates/gitsot-core/src/cli.rs` | Network operations through the `git` command, run in the background |
+| `crates/gitsot-core/src/term.rs` | One built-in terminal: the shell in a pseudo-terminal and its screen (`alacritty_terminal`) |
+| `crates/gitsot-core/src/shell.rs` | Picks the shell (PowerShell / zsh / bash) and loads the Gitsot prompt into it |
+| `crates/gitsot-core/assets/prompt.ps1`, `prompt.sh` | The Gitsot prompt for PowerShell and for zsh/bash |
 
 ## Tests
 

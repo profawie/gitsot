@@ -1,0 +1,23 @@
+[package]
+name = "gitsot-app"
+description = "gitsot application library: the whole UI, built as gitsot.dll / libgitsot.so / libgitsot.dylib"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+# The output file is gitsot.dll (Windows), libgitsot.so (Linux) or
+# libgitsot.dylib (macOS). The `gitsot` executable loads it at start-up.
+name = "gitsot"
+crate-type = ["cdylib"]
+
+[dependencies]
+gitsot-core.workspace = true
+eframe.workspace = true
+egui.workspace = true
+git2.workspace = true
+rfd.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+alacritty_terminal.workspace = true

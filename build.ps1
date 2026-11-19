@@ -11,7 +11,13 @@
       This script adds C:\msys64\mingw64\bin to PATH automatically if it exists.
 
   The GNU Rust toolchain is installed automatically if missing.
-  Output: dist\gitsot.exe
+
+  Output: dist\gitsot, a folder with every file gitsot needs:
+    gitsot.exe   the small launcher you start
+    gitsot.dll   the application itself (UI, Git, terminal)
+    + any MinGW runtime DLLs the two files import (usually none, because
+      Rust links them statically)
+  Copy the whole folder to another PC and run gitsot.exe from there.
 
 .EXAMPLE
   .\build.ps1          # release build
@@ -70,12 +76,52 @@ if ($installed -notmatch [regex]::Escape($Toolchain)) {
     if ($LASTEXITCODE -ne 0) { Fail "could not install $Toolchain" }
 }
 
-Write-Host "==> Building Gitsot ($Target, $BuildProfile)"
-$cargoArgs = @("+$Toolchain", 'build', '--target', $Target)
+$Version = (Select-String -Path 'Cargo.toml' -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+
+Write-Host "==> Building gitsot $Version ($Target, $BuildProfile)"
+$cargoArgs = @("+$Toolchain", 'build', '--workspace', '--target', $Target)
 if (-not $Dev) { $cargoArgs += '--release' }
 & cargo @cargoArgs
 if ($LASTEXITCODE -ne 0) { Fail 'build failed' }
 
-New-Item -ItemType Directory -Force -Path dist | Out-Null
-Copy-Item "target\$Target\$BuildProfile\gitsot.exe" 'dist\gitsot.exe' -Force
-Write-Host "==> Done: dist\gitsot.exe" -ForegroundColor Green
+# Assemble the release folder.
+$Built = "target\$Target\$BuildProfile"
+$Out   = 'dist\gitsot'
+if (Test-Path $Out) {
+    try {
+        Remove-Item -Recurse -Force $Out
+    } catch {
+        Fail "cannot replace $Out. Close gitsot if it is running from that folder and try again."
+    }
+}
+New-Item -ItemType Directory -Force -Path $Out | Out-Null
+Copy-Item "$Built\gitsot.exe" "$Out\gitsot.exe" -Force
+Copy-Item "$Built\gitsot.dll" "$Out\gitsot.dll" -Force
+
+# Copy the MinGW runtime DLLs (libgcc, libwinpthread, ...) that a file
+# imports, if any. DLLs that are not in the MinGW folder are part of Windows.
+$MingwBin = Split-Path -Parent (Get-Command gcc).Source
+$Objdump  = Join-Path $MingwBin 'objdump.exe'
+function Copy-RuntimeDlls([string]$File) {
+    $imports = & $Objdump -p $File | Select-String -Pattern '^\s*DLL Name: (.+)$' |
+        ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() } | Sort-Object -Unique
+    foreach ($dll in $imports) {
+        $dest = Join-Path $Out $dll
+        if (Test-Path $dest) { continue }
+        $src = Join-Path $MingwBin $dll
+        if (-not (Test-Path $src)) { continue }
+        Write-Host "    + $dll"
+        Copy-Item $src $dest -Force
+        Copy-RuntimeDlls $dest
+    }
+}
+Write-Host '==> Collecting runtime DLLs'
+if (Test-Path $Objdump) {
+    Copy-RuntimeDlls "$Out\gitsot.exe"
+    Copy-RuntimeDlls "$Out\gitsot.dll"
+} else {
+    Write-Host "    objdump.exe not found in $MingwBin, skipping (install mingw-w64-x86_64-binutils)" -ForegroundColor Yellow
+}
+
+Write-Host "==> Done: $Out" -ForegroundColor Green
+Get-ChildItem $Out | ForEach-Object { Write-Host "    $($_.Name)" }
