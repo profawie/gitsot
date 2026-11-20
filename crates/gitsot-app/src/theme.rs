@@ -5,12 +5,12 @@ use eframe::egui::{
     Visuals,
 };
 
-/// The look is shared with termker: same colours, text sizes, spacing and sidebar.
+/// The look is shared with termker: same colours, text sizes and spacing.
 #[derive(Clone, Copy)]
 pub struct Palette {
     /// Page background.
     pub bg: Color32,
-    /// Sidebar and dialog background.
+    /// Ribbon and dialog background.
     pub panel: Color32,
     /// Card and input field background.
     pub surface: Color32,
@@ -211,35 +211,96 @@ pub fn primary_wide(ui: &mut Ui, enabled: bool, text: impl Into<String>, height:
     })
 }
 
-/// A sidebar navigation item, like termker's: full width, 34 px, accent fill
-/// with white bold text when selected, a light hover otherwise.
-pub fn nav_item(ui: &mut Ui, selected: bool, text: &str, badge: Option<usize>) -> Response {
+/// A ribbon command: an icon with its name under it. `accent` draws the
+/// icon in the accent colour, for the action that is waiting to be done.
+pub fn ribbon_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool, accent: bool) -> Response {
     let p = pal(ui);
-    let label = if selected {
-        RichText::new(text).color(Color32::WHITE).strong()
-    } else {
-        RichText::new(text)
+    let label_font = FontId::proportional(12.0);
+    let text = ui.painter().layout_no_wrap(label.to_owned(), label_font, p.text);
+    let size = Vec2::new((text.size().x + 18.0).max(56.0), 48.0);
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let painter = ui.painter();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    if enabled && (response.hovered() || pressed) {
+        painter.rect(
+            rect,
+            6.0,
+            p.accent.gamma_multiply(if pressed { 0.3 } else { 0.18 }),
+            Stroke::new(1.0, p.border),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let (icon_color, text_color) = match (enabled, accent) {
+        (false, _) => (p.text_dim.gamma_multiply(0.5), p.text_dim.gamma_multiply(0.5)),
+        (true, true) => (p.accent_text, p.text),
+        (true, false) => (p.text, p.text),
     };
-    let mut button = egui::Button::new(label).min_size(Vec2::new(ui.available_width(), 34.0)).frame_when_inactive(false);
-    if selected {
-        button = button.fill(p.accent).frame_when_inactive(true);
+    painter.text(
+        Pos2::new(rect.center().x, rect.top() + 17.0),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        FontId::proportional(18.0),
+        icon_color,
+    );
+    painter.galley_with_override_text_color(
+        Pos2::new(rect.center().x - text.size().x / 2.0, rect.bottom() - text.size().y - 5.0),
+        text,
+        text_color,
+    );
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
     }
-    let resp = ui.add(button);
-    if let Some(n) = badge.filter(|n| *n > 0) {
-        let label = n.to_string();
-        let w = 10.0 + 7.0 * label.len() as f32;
-        let rect = resp.rect;
-        let badge_rect = Rect::from_center_size(rect.right_center() - Vec2::new(10.0 + w / 2.0, 0.0), Vec2::new(w, 18.0));
-        let (bg, fg) = if selected {
-            (Color32::from_white_alpha(60), Color32::WHITE)
-        } else {
-            (p.accent, Color32::WHITE)
-        };
-        let painter = ui.painter();
-        painter.rect_filled(badge_rect, 9.0, bg);
-        painter.text(badge_rect.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(11.5), fg);
+}
+
+/// What happened to a tab of the tab strip this frame.
+pub struct TabResponse {
+    pub response: Response,
+    pub close: bool,
+}
+
+/// One tab of the tab strip. The active tab joins the page under it; a
+/// closable tab has an × on its right. A pinned tab has none.
+pub fn tab(ui: &mut Ui, title: &str, active: bool, closable: bool) -> TabResponse {
+    let p = pal(ui);
+    let color = if active { p.text } else { p.text_dim };
+    let text = ui.painter().layout_no_wrap(title.to_owned(), FontId::proportional(13.5), color);
+    let close_w = if closable { 22.0 } else { 0.0 };
+    let size = Vec2::new(text.size().x + 24.0 + close_w, 30.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let close_rect = Rect::from_center_size(Pos2::new(rect.right() - 16.0, rect.center().y), Vec2::splat(18.0));
+    let close = closable && ui.interact(close_rect, response.id.with("close"), Sense::click()).on_hover_text("Close tab").clicked();
+    let over_close = closable && ui.rect_contains_pointer(close_rect);
+
+    let painter = ui.painter();
+    let radius = CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+    if active {
+        painter.rect_filled(rect, radius, p.bg);
+        painter.line_segment(
+            [rect.left_top() + Vec2::new(5.0, 1.0), rect.right_top() + Vec2::new(-5.0, 1.0)],
+            Stroke::new(2.0, p.accent_text),
+        );
+    } else if response.hovered() || over_close {
+        painter.rect_filled(rect, radius, p.surface);
     }
-    resp
+    painter.galley(Pos2::new(rect.left() + 12.0, rect.center().y - text.size().y / 2.0), text, color);
+    if closable {
+        if over_close {
+            painter.rect_filled(close_rect, 4.0, p.border);
+        }
+        let c = close_rect.center();
+        let stroke = Stroke::new(1.4, if over_close { p.text } else { p.text_dim });
+        painter.line_segment([c + Vec2::new(-3.5, -3.5), c + Vec2::new(3.5, 3.5)], stroke);
+        painter.line_segment([c + Vec2::new(-3.5, 3.5), c + Vec2::new(3.5, -3.5)], stroke);
+    }
+    TabResponse { response, close }
+}
+
+/// Small heading at the top of a column.
+pub fn column_header(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text.to_uppercase()).small().strong().weak());
 }
 
 /// Gitsot's logo: a small branch diagram (two lanes joining) in a rounded square.

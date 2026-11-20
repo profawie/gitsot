@@ -123,6 +123,30 @@ fn run(cwd: Option<&Path>, args: &[&str], creds: Option<&Credentials>) -> Result
     }
 }
 
+/// Ask Git's credential helpers for the sign-in saved for `url`, without ever
+/// prompting. `None` when nothing is saved (or no helper is configured).
+pub fn credential_fill(repo: &Path, url: &str) -> Option<Credentials> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = command(Some(repo))
+        .args(["credential", "fill"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let url: String = url.trim().chars().filter(|c| !c.is_control()).collect();
+    child.stdin.take()?.write_all(format!("url={url}\n\n").as_bytes()).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value = |key: &str| text.lines().find_map(|l| l.strip_prefix(key)).map(str::to_string);
+    let password = value("password=").filter(|p| !p.is_empty())?;
+    Some(Credentials { username: value("username=").unwrap_or_default(), password })
+}
+
 /// Did git fail because the remote wants a username/password we could not supply?
 pub fn is_auth_error(text: &str) -> bool {
     let lower = text.to_lowercase();

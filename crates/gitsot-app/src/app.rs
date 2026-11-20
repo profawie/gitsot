@@ -10,6 +10,7 @@ use git2::{Oid, Repository};
 use serde::{Deserialize, Serialize};
 
 use gitsot_core::cli::{self, Credentials, NetOp, NetResult};
+use gitsot_core::forge::{self, Filter, ReviewEvent};
 use gitsot_core::git::{
     self, BranchInfo, ChangeKind, CommitFile, CommitInfo, FileChange, FileDiff, HeadInfo, LineKind, RefKind,
     RefLabel,
@@ -17,6 +18,7 @@ use gitsot_core::git::{
 use gitsot_core::graph::{self, Graph};
 use gitsot_core::identity::{self, FolderRule, Identity};
 use gitsot_core::term::Terminal;
+use crate::pulls::{self, Load, PullTab, Pulls};
 use crate::{term_view, theme};
 use gitsot_core::shell;
 use std::collections::HashMap;
@@ -26,6 +28,8 @@ const MAX_RECENT: usize = 12;
 /// Git logo glyph from egui's bundled icon font, used as the "branch" icon.
 const BRANCH_ICON: &str = "\u{E625}";
 const TERMINAL_SHORTCUT: &str = "Ctrl+`";
+/// Id of the pinned first tab.
+const HOME: u64 = 0;
 
 // ---------------------------------------------------------------------------
 // Persistent settings
@@ -49,6 +53,8 @@ struct Settings {
     /// Load Gitsot's prompt (labelled chips) into the built-in terminal.
     terminal_prompt: bool,
     terminal_font_size: f32,
+    /// Hosts the user marked as GitHub Enterprise, for pull requests.
+    github_hosts: Vec<String>,
 }
 
 impl Default for Settings {
@@ -64,6 +70,7 @@ impl Default for Settings {
             collapsed_groups: Vec::new(),
             terminal_prompt: true,
             terminal_font_size: 14.0,
+            github_hosts: Vec::new(),
         }
     }
 }
@@ -96,8 +103,8 @@ struct RepoView {
     remote_url: Option<String>,
 
     changes: Vec<FileChange>,
-    selected_change: Option<String>,
-    change_diff: Option<Result<FileDiff, String>>,
+    /// Goes up on every reload, so open diff tabs know when to reload too.
+    generation: u64,
     summary: String,
     description: String,
 
@@ -132,8 +139,7 @@ impl RepoView {
             remote_url: None,
             repo,
             changes: Vec::new(),
-            selected_change: None,
-            change_diff: None,
+            generation: 0,
             summary: String::new(),
             description: String::new(),
             history: Vec::new(),
@@ -168,27 +174,12 @@ impl RepoView {
         self.branches = git::local_branches(&self.repo).unwrap_or_default();
         self.remote_branches = git::remote_branches(&self.repo).unwrap_or_default();
 
-        if let Some(sel) = &self.selected_change {
-            if !self.changes.iter().any(|c| &c.path == sel) {
-                self.selected_change = None;
-            }
-        }
-        if self.selected_change.is_none() {
-            self.selected_change = self.changes.first().map(|c| c.path.clone());
-        }
-        self.load_change_diff();
+        self.generation += 1;
 
         if self.history_loaded {
             self.load_history(self.history_all);
         }
         Ok(())
-    }
-
-    fn load_change_diff(&mut self) {
-        self.change_diff = self
-            .selected_change
-            .as_ref()
-            .map(|p| git::working_diff(&self.repo, p).map_err(|e| e.to_string()));
     }
 
     fn load_history(&mut self, all_refs: bool) {
@@ -243,14 +234,44 @@ fn strip_unc(p: PathBuf) -> PathBuf {
 // UI helpers
 // ---------------------------------------------------------------------------
 
+/// Pages that open in one closable tab each.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Page {
+pub(crate) enum Page {
     Repositories,
-    Changes,
-    History,
-    Terminal,
     Settings,
     About,
+    /// The list of pull requests of the open repository.
+    Pulls,
+}
+
+/// Where the diff shown in a tab comes from.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum DiffSource {
+    /// Uncommitted changes of a file. Reloaded when the repository changes.
+    Working,
+    Commit(Oid),
+}
+
+struct DiffTab {
+    source: DiffSource,
+    path: String,
+    diff: Result<FileDiff, String>,
+}
+
+enum TabKind {
+    /// The pinned first tab: changes, history and commit details of the open
+    /// repository, or the repository list when none is open.
+    Home,
+    Page(Page),
+    Diff(DiffTab),
+    /// One shell session. It keeps running while other tabs are shown.
+    Terminal { number: usize, terminal: Box<Terminal> },
+    Pull(Box<PullTab>),
+}
+
+struct Tab {
+    id: u64,
+    kind: TabKind,
 }
 
 /// What the Repositories page shows for one remembered repository.
@@ -283,7 +304,17 @@ enum IdTab {
     Repo,
 }
 
+/// Ask for a comment, then send a review of pull request `number`.
+struct ReviewForm {
+    number: u64,
+    event: ReviewEvent,
+    body: String,
+}
+
 enum Dialog {
+    Review(ReviewForm),
+    /// Access token for pull requests, kept for this session only.
+    Token { token: String },
     Clone { url: String, parent: String, name: String, name_edited: bool },
     NewBranch { name: String },
     Identity { name: String, email: String, commit_after: bool },
@@ -303,19 +334,38 @@ enum Dialog {
 
 /// Things the user asked for while drawing the UI; applied afterwards so we
 /// never mutate state while it is borrowed by a widget.
-enum Action {
+pub(crate) enum Action {
     OpenDialog,
     OpenPath(PathBuf),
-    /// Open the built-in terminal in a repository (opening it first if needed).
+    /// Start a new terminal session in a repository (opening it first if
+    /// needed) and show it in a new tab.
     OpenTerminal(PathBuf),
+    /// A new terminal tab for the open repository.
+    NewTerminal,
     RestartTerminal,
+    Activate(u64),
+    CloseTab(u64),
+    /// Show one of the single pages in its tab, opening the tab if needed.
+    Show(Page),
+    /// Open a file's diff in a tab (or go to the tab that already shows it).
+    OpenDiff(DiffSource, String),
+    ReloadPulls,
+    SetPullFilter(Filter),
+    OpenPull { number: u64, title: String },
+    ReloadPull(u64),
+    AskReview(u64, ReviewEvent),
+    SubmitReview { number: u64, event: ReviewEvent, body: String },
+    AskToken,
+    SetToken(Option<String>),
+    TreatAsGitHub(String),
+    ForgetGitHubHost(String),
+    OpenUrl(String),
     SetTerminalPrompt(bool),
     SetTerminalFontSize(f32),
     InitDialog,
     ShowClone,
     CloseRepo,
     Refresh,
-    SelectChange(String),
     Stage(Vec<String>),
     Unstage(Vec<String>),
     StageAll,
@@ -341,7 +391,6 @@ enum Action {
     CopyToClipboard(String),
     SetLightMode(bool),
     ForgetRecent(PathBuf),
-    GoTo(Page),
     SetHistoryTree(bool),
     SetLocalIdentity(Identity),
     EditRepoIdentity,
@@ -369,7 +418,19 @@ struct Toast {
 pub struct GitsotApp {
     settings: Settings,
     repo: Option<RepoView>,
-    page: Page,
+    /// Open tabs, the pinned Home tab first.
+    tabs: Vec<Tab>,
+    /// Id of the tab on show.
+    active: u64,
+    /// The tab shown before it, to go back to when the active tab closes.
+    previous: u64,
+    next_tab_id: u64,
+    /// `RepoView::generation` the diff tabs were last loaded for.
+    diffs_generation: u64,
+    /// Pull requests of the open repository.
+    pulls: Pulls,
+    forge_tx: Sender<pulls::Reply>,
+    forge_rx: Receiver<pulls::Reply>,
     cards: Vec<RepoCard>,
     repo_filter: String,
     identity: (String, String),
@@ -384,12 +445,11 @@ pub struct GitsotApp {
     tx: Sender<NetResult>,
     rx: Receiver<NetResult>,
     git_cli: bool,
+    /// The `curl` command is installed (used for pull requests).
+    curl_cli: bool,
     was_focused: bool,
     /// Username typed into the last sign-in dialog, to pre-fill a retry.
     last_username: String,
-    /// Built-in terminals, at most one per repository. They keep running
-    /// while another repository or page is shown.
-    terminals: Vec<Terminal>,
 }
 
 impl GitsotApp {
@@ -399,10 +459,18 @@ impl GitsotApp {
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
             .unwrap_or_default();
         let (tx, rx) = channel();
+        let (forge_tx, forge_rx) = channel();
         let mut app = Self {
             settings,
             repo: None,
-            page: Page::Repositories,
+            tabs: vec![Tab { id: HOME, kind: TabKind::Home }],
+            active: HOME,
+            previous: HOME,
+            next_tab_id: HOME + 1,
+            diffs_generation: 0,
+            pulls: Pulls::default(),
+            forge_tx,
+            forge_rx,
             cards: Vec::new(),
             repo_filter: String::new(),
             identity: { let g = identity::global(); (g.name, g.email) },
@@ -417,9 +485,9 @@ impl GitsotApp {
             tx,
             rx,
             git_cli: cli::git_available(),
+            curl_cli: forge::curl_available(),
             was_focused: true,
             last_username: String::new(),
-            terminals: Vec::new(),
         };
         theme::apply(&cc.egui_ctx, app.settings.light_mode);
 
@@ -470,11 +538,14 @@ impl GitsotApp {
 
     fn open_repo(&mut self, path: &Path) {
         match RepoView::open(path) {
-            Ok(view) => {
+            Ok(mut view) => {
                 self.settings.remember(&view.path);
                 self.info(format!("Opened {}", view.name()));
+                view.load_history(self.settings.history_view_tree);
+                self.close_repo_tabs(false);
+                self.pulls = Pulls::new(view.remote_url.as_deref(), &self.settings.github_hosts);
                 self.repo = Some(view);
-                self.page = Page::Changes;
+                self.active = HOME;
                 self.reload_identity();
             }
             Err(e) => self.error(format!("{e:#}")),
@@ -506,16 +577,110 @@ impl GitsotApp {
                 if self.repo.as_ref().is_none_or(|r| r.path != p) {
                     self.open_repo(&p);
                 }
-                if self.repo.is_some() {
-                    self.page = Page::Terminal;
+                if self.repo.as_ref().is_some_and(|r| r.path == p) {
+                    self.new_terminal(ctx, &p);
+                }
+            }
+            Action::NewTerminal => {
+                if let Some(path) = self.repo.as_ref().map(|r| r.path.clone()) {
+                    self.new_terminal(ctx, &path);
                 }
             }
             Action::RestartTerminal => {
-                if let Some(path) = self.repo.as_ref().map(|r| r.path.clone()) {
-                    self.terminals.retain(|t| t.repo != path);
-                    self.start_terminal(ctx, &path);
+                // A fresh shell in the same tab and folder.
+                let active = self.active;
+                let prompt = self.settings.terminal_prompt;
+                let mut failed = None;
+                if let Some(TabKind::Terminal { terminal, .. }) = self.tabs.iter_mut().find(|t| t.id == active).map(|t| &mut t.kind) {
+                    let path = terminal.repo.clone();
+                    let wake = ctx.clone();
+                    match Terminal::open(&path, shell::launch(&path, prompt), move || wake.request_repaint()) {
+                        Ok(new) => **terminal = new,
+                        Err(e) => failed = Some(format!("Could not start the terminal: {e:#}")),
+                    }
+                }
+                if let Some(message) = failed {
+                    self.error(message);
                 }
             }
+            Action::Activate(id) => self.activate(id),
+            Action::CloseTab(id) => self.close_tab(id),
+            Action::Show(page) => {
+                match page {
+                    Page::Repositories => self.reload_cards(),
+                    Page::Settings => self.reload_identity(),
+                    Page::Pulls if matches!(self.pulls.list, Load::Idle) => self.start_forge(ctx, pulls::Request::List(self.pulls.filter)),
+                    _ => {}
+                }
+                // With no repository open, the Home tab is the repository list.
+                let id = if page == Page::Repositories && self.repo.is_none() {
+                    HOME
+                } else {
+                    match self.tabs.iter().find(|t| matches!(t.kind, TabKind::Page(p) if p == page)) {
+                        Some(tab) => tab.id,
+                        None => self.add_tab(TabKind::Page(page)),
+                    }
+                };
+                self.activate(id);
+            }
+            Action::OpenDiff(source, path) => {
+                let Some(r) = &self.repo else { return };
+                let existing = self.tabs.iter().find(|t| matches!(&t.kind, TabKind::Diff(d) if d.source == source && d.path == path)).map(|t| t.id);
+                let id = match existing {
+                    Some(id) => id,
+                    None => {
+                        let diff = load_diff(r, &source, &path);
+                        self.add_tab(TabKind::Diff(DiffTab { source, path, diff }))
+                    }
+                };
+                self.activate(id);
+            }
+            Action::ReloadPulls => self.start_forge(ctx, pulls::Request::List(self.pulls.filter)),
+            Action::SetPullFilter(filter) => {
+                self.pulls.filter = filter;
+                self.start_forge(ctx, pulls::Request::List(filter));
+            }
+            Action::OpenPull { number, title } => {
+                let existing = self.tabs.iter().find(|t| matches!(&t.kind, TabKind::Pull(p) if p.number == number)).map(|t| t.id);
+                let id = match existing {
+                    Some(id) => id,
+                    None => {
+                        let id = self.add_tab(TabKind::Pull(Box::new(PullTab::new(number, title))));
+                        self.start_forge(ctx, pulls::Request::Detail(number));
+                        id
+                    }
+                };
+                self.activate(id);
+            }
+            Action::ReloadPull(number) => self.start_forge(ctx, pulls::Request::Detail(number)),
+            Action::AskReview(number, event) => {
+                self.dialog = Some(Dialog::Review(ReviewForm { number, event, body: String::new() }));
+            }
+            Action::SubmitReview { number, event, body } => {
+                self.dialog = None;
+                self.start_forge(ctx, pulls::Request::Review { number, event, body });
+            }
+            Action::AskToken => self.dialog = Some(Dialog::Token { token: String::new() }),
+            Action::SetToken(token) => {
+                self.dialog = None;
+                self.pulls.token = token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+                self.pulls.viewer = None;
+                self.reload_all_pulls(ctx);
+            }
+            Action::TreatAsGitHub(host) => {
+                if !self.settings.github_hosts.contains(&host) {
+                    self.settings.github_hosts.push(host);
+                }
+                let url = self.repo.as_ref().and_then(|r| r.remote_url.clone());
+                self.pulls = Pulls::new(url.as_deref(), &self.settings.github_hosts);
+                self.reload_all_pulls(ctx);
+            }
+            Action::ForgetGitHubHost(host) => {
+                self.settings.github_hosts.retain(|h| *h != host);
+                let url = self.repo.as_ref().and_then(|r| r.remote_url.clone());
+                self.pulls = Pulls::new(url.as_deref(), &self.settings.github_hosts);
+            }
+            Action::OpenUrl(url) => open_url(&url),
             Action::SetTerminalPrompt(on) => self.settings.terminal_prompt = on,
             Action::SetTerminalFontSize(size) => self.settings.terminal_font_size = size,
             Action::InitDialog => {
@@ -552,13 +717,12 @@ impl GitsotApp {
                 });
             }
             Action::CloseRepo => {
-                // Closing a repository also ends its terminal.
-                if let Some(r) = &self.repo {
-                    self.terminals.retain(|t| t.repo != r.path);
-                }
+                // Closing a repository also ends its terminals.
+                self.close_repo_tabs(true);
                 self.repo = None;
+                self.pulls = Pulls::default();
                 self.settings.last_repo = None;
-                self.page = Page::Repositories;
+                self.active = HOME;
                 self.reload_cards();
             }
             Action::Refresh => {
@@ -571,26 +735,6 @@ impl GitsotApp {
             Action::SetLightMode(light) => {
                 self.settings.light_mode = light;
                 theme::apply(ctx, light);
-            }
-            Action::GoTo(page) => {
-                // Commands typed in the terminal may have changed anything.
-                if self.page == Page::Terminal && page != Page::Terminal {
-                    self.refresh();
-                }
-                if page == Page::Repositories {
-                    self.reload_cards();
-                }
-                if page == Page::Settings {
-                    self.reload_identity();
-                }
-                if page == Page::History {
-                    if let Some(r) = &mut self.repo {
-                        if !r.history_loaded || r.history_all != self.settings.history_view_tree {
-                            r.load_history(self.settings.history_view_tree);
-                        }
-                    }
-                }
-                self.page = page;
             }
             Action::SetHistoryTree(tree) => {
                 self.settings.history_view_tree = tree;
@@ -688,9 +832,8 @@ impl GitsotApp {
                 self.skip_identity_check = false;
             }
             Action::EditRepoIdentity => {
-                self.reload_identity();
                 self.id_tab = IdTab::Repo;
-                self.page = Page::Settings;
+                self.apply(ctx, Action::Show(Page::Settings));
             }
             Action::AskGroup(path) => {
                 let name = self.settings.groups.get(&path).cloned().unwrap_or_default();
@@ -741,11 +884,6 @@ impl GitsotApp {
                 let Some(r) = self.repo.as_mut() else { return };
                 let result: anyhow::Result<Option<String>> = (|| {
                     match other {
-                        Action::SelectChange(p) => {
-                            r.selected_change = Some(p);
-                            r.load_change_diff();
-                            return Ok(None);
-                        }
                         Action::Stage(paths) => git::stage(&r.repo, &paths)?,
                         Action::Unstage(paths) => git::unstage(&r.repo, &paths)?,
                         Action::StageAll => git::stage_all(&r.repo)?,
@@ -993,7 +1131,7 @@ impl GitsotApp {
                 (NetOp::Merge { branch }, Err(e)) if self.repo.as_ref().is_some_and(|r| r.repo.state() == git2::RepositoryState::Merge) => {
                     let branch = branch.clone();
                     self.refresh();
-                    self.page = Page::Changes;
+                    self.active = HOME;
                     self.dialog = Some(Dialog::Message {
                         title: "The merge has conflicts".into(),
                         text: format!(
@@ -1022,13 +1160,24 @@ impl GitsotApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        // Ctrl+` switches between the terminal and Changes.
+        let in_terminal = matches!(self.active_tab().kind, TabKind::Terminal { .. });
+        // Ctrl+` goes to this repository's terminal (starting one if there is
+        // none) and back to the first tab.
         if self.repo.is_some() && self.dialog.is_none() && ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backtick)) {
-            actions.push(Action::GoTo(if self.page == Page::Terminal { Page::Changes } else { Page::Terminal }));
+            let path = self.repo.as_ref().map(|r| r.path.clone());
+            let last = self.tabs.iter().rev().find(|t| matches!(&t.kind, TabKind::Terminal { terminal, .. } if Some(&terminal.repo) == path.as_ref()));
+            actions.push(match (in_terminal, last) {
+                (true, _) => Action::Activate(HOME),
+                (false, Some(tab)) => Action::Activate(tab.id),
+                (false, None) => Action::NewTerminal,
+            });
         }
         // In the terminal every other key belongs to the shell (Ctrl+R
-        // searches its history, for one).
-        if self.page != Page::Terminal {
+        // searches its history, Ctrl+W deletes a word).
+        if !in_terminal {
+            if self.active != HOME && self.dialog.is_none() && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::W)) {
+                actions.push(Action::CloseTab(self.active));
+            }
             let refresh = ctx.input_mut(|i| {
                 i.consume_key(Modifiers::NONE, Key::F5) || i.consume_key(Modifiers::COMMAND, Key::R)
             });
@@ -1050,6 +1199,99 @@ impl GitsotApp {
     }
 }
 
+/// The pinned tab of an open repository: changes, history and the selected
+/// commit side by side, so there is no switching between them.
+fn workspace(ui: &mut egui::Ui, r: &mut RepoView, history_tree: bool, open_diffs: &[String], actions: &mut Vec<Action>) {
+    let column = |left: i8, right: i8| egui::Frame::new().inner_margin(egui::Margin { left, right, top: 8, bottom: 8 });
+    egui::Panel::left("workspace_changes")
+        .resizable(true)
+        .default_size(310.0)
+        .min_size(230.0)
+        .frame(column(12, 8))
+        .show(ui, |ui| changes_column(ui, r, open_diffs, actions));
+    egui::Panel::right("workspace_commit")
+        .resizable(true)
+        .default_size(460.0)
+        .min_size(260.0)
+        .frame(column(8, 10))
+        .show(ui, |ui| commit_column(ui, r, actions));
+    egui::CentralPanel::default().frame(column(8, 8)).show(ui, |ui| {
+        theme::column_header(ui, &format!("History · {}", if history_tree { "all branches".to_string() } else { r.head.display_name() }));
+        ui.add_space(4.0);
+        history_column(ui, r, history_tree, actions);
+    });
+}
+
+/// A file's diff in its own tab.
+fn diff_page(ui: &mut egui::Ui, d: &DiffTab, r: &RepoView) {
+    egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(egui::Margin::same(10))).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            match &d.source {
+                DiffSource::Working => {
+                    if let Some(change) = r.changes.iter().find(|c| c.path == d.path) {
+                        kind_badge(ui, change.kind);
+                    }
+                    ui.label(RichText::new(&d.path).strong().monospace());
+                    ui.label(RichText::new("uncommitted changes").weak());
+                }
+                DiffSource::Commit(id) => {
+                    ui.label(RichText::new(&d.path).strong().monospace());
+                    let summary = r.history.iter().find(|c| c.id == *id).map(|c| c.summary.as_str()).unwrap_or_default();
+                    ui.add(egui::Label::new(RichText::new(format!("in {}  {summary}", git::short(*id))).weak()).truncate());
+                }
+            }
+        });
+        ui.separator();
+        match &d.diff {
+            Ok(diff) => diff_view(ui, diff, &format!("tab_diff/{}", d.path)),
+            Err(e) => {
+                ui.label(RichText::new(e).color(theme::RED));
+            }
+        }
+    });
+}
+
+fn load_diff(r: &RepoView, source: &DiffSource, path: &str) -> Result<FileDiff, String> {
+    match source {
+        DiffSource::Working => git::working_diff(&r.repo, path),
+        DiffSource::Commit(id) => git::commit_file_diff(&r.repo, *id, path),
+    }
+    .map_err(|e| format!("{e:#}"))
+}
+
+fn close_tab_button(ui: &mut egui::Ui, id: u64, actions: &mut Vec<Action>) {
+    if theme::ribbon_button(ui, "✖", "Close tab", true, false).on_hover_text("Close this tab (Ctrl+W)").clicked() {
+        actions.push(Action::CloseTab(id));
+    }
+}
+
+/// Shorten long names for buttons and tabs.
+pub(crate) fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        format!("{}…", text.chars().take(max.saturating_sub(1)).collect::<String>())
+    }
+}
+
+/// Open a web page in the default browser. Only `http(s)` addresses.
+fn open_url(url: &str) {
+    if !cli::is_http_url(url) {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("rundll32");
+        cmd.arg("url.dll,FileProtocolHandler");
+        cmd
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    let _ = cmd.arg(url).spawn();
+}
+
 fn default_clone_parent() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     let docs = PathBuf::from(&home).join("Documents");
@@ -1067,7 +1309,7 @@ fn open_in_file_manager(path: &Path) {
     let _ = std::process::Command::new(cmd).arg(path).spawn();
 }
 
-fn relative_time(secs: i64) -> String {
+pub(crate) fn relative_time(secs: i64) -> String {
     let now = chrono::Utc::now().timestamp();
     let d = (now - secs).max(0);
     match d {
@@ -1089,7 +1331,7 @@ fn plural(n: i64, unit: &str) -> String {
     }
 }
 
-fn full_time(secs: i64) -> String {
+pub(crate) fn full_time(secs: i64) -> String {
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|t| t.with_timezone(&chrono::Local).format("%a %d %b %Y, %H:%M").to_string())
         .unwrap_or_default()
@@ -1108,7 +1350,7 @@ fn kind_color(kind: ChangeKind, dark: bool) -> Color32 {
     }
 }
 
-fn kind_badge(ui: &mut egui::Ui, kind: ChangeKind) {
+pub(crate) fn kind_badge(ui: &mut egui::Ui, kind: ChangeKind) {
     let dark = ui.visuals().dark_mode;
     ui.label(RichText::new(kind.letter()).monospace().strong().color(kind_color(kind, dark)))
         .on_hover_text(kind.description());
@@ -1122,7 +1364,7 @@ fn split_path(path: &str) -> (&str, &str) {
     }
 }
 
-fn file_row(ui: &mut egui::Ui, selected: bool, path: &str) -> egui::Response {
+pub(crate) fn file_row(ui: &mut egui::Ui, selected: bool, path: &str) -> egui::Response {
     let (name, dir) = split_path(path);
     let mut job = egui::text::LayoutJob::default();
     let strong = ui.visuals().strong_text_color();
@@ -1155,21 +1397,15 @@ impl eframe::App for GitsotApp {
         let mut actions = Vec::new();
         self.handle_shortcuts(&ctx, &mut actions);
 
-        if self.repo.is_none() && matches!(self.page, Page::Changes | Page::History | Page::Terminal) {
-            self.page = Page::Repositories;
-        }
+        self.poll_forge(&ctx);
+        self.poll_terminals(&mut actions);
+        self.sync_diff_tabs();
 
-        self.nav_sidebar(ui, &mut actions);
+        self.ribbon(ui, &mut actions);
         self.status_bar(ui);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::same(0)))
-            .show(ui, |ui| match self.page {
-                Page::Repositories => self.repositories_page(ui, &mut actions),
-                Page::Changes | Page::History => self.repo_page(ui, &mut actions),
-                Page::Terminal => self.terminal_page(ui, &mut actions),
-                Page::Settings => self.settings_page(ui, &mut actions),
-                Page::About => about_page(ui),
-            });
+            .show(ui, |ui| self.tab_content(ui, &mut actions));
 
         self.dialogs(&ctx, &mut actions);
 
@@ -1192,55 +1428,528 @@ impl eframe::App for GitsotApp {
 }
 
 impl GitsotApp {
-    fn nav_sidebar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    // -----------------------------------------------------------------------
+    // Tabs
+    // -----------------------------------------------------------------------
+
+    fn active_tab(&self) -> &Tab {
+        self.tabs.iter().find(|t| t.id == self.active).unwrap_or(&self.tabs[0])
+    }
+
+    fn add_tab(&mut self, kind: TabKind) -> u64 {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(Tab { id, kind });
+        id
+    }
+
+    fn activate(&mut self, id: u64) {
+        if id == self.active || !self.tabs.iter().any(|t| t.id == id) {
+            return;
+        }
+        // Commands typed in a terminal may have changed anything.
+        if matches!(self.active_tab().kind, TabKind::Terminal { .. }) {
+            self.refresh();
+        }
+        self.previous = self.active;
+        self.active = id;
+        if id == HOME && self.repo.is_none() {
+            self.reload_cards();
+        }
+    }
+
+    /// Close a tab (never the pinned one). When it was on show, go back to
+    /// the tab shown before it, or to its left neighbour.
+    fn close_tab(&mut self, id: u64) {
+        let Some(index) = self.tabs.iter().position(|t| t.id == id).filter(|_| id != HOME) else { return };
+        self.tabs.remove(index);
+        if self.active == id {
+            let back = self.previous;
+            self.active = if self.tabs.iter().any(|t| t.id == back) { back } else { self.tabs[index - 1].id };
+            self.previous = HOME;
+        }
+    }
+
+    /// Close the tabs that belong to the open repository: diffs and pull
+    /// requests, and its terminals too when `terminals` is set.
+    fn close_repo_tabs(&mut self, terminals: bool) {
+        let path = self.repo.as_ref().map(|r| r.path.clone());
+        self.tabs.retain(|t| match &t.kind {
+            TabKind::Home | TabKind::Page(Page::Repositories | Page::Settings | Page::About) => true,
+            TabKind::Page(Page::Pulls) | TabKind::Diff(_) | TabKind::Pull(_) => false,
+            TabKind::Terminal { terminal, .. } => !(terminals && Some(&terminal.repo) == path.as_ref()),
+        });
+        if !self.tabs.iter().any(|t| t.id == self.active) {
+            self.active = HOME;
+        }
+    }
+
+    /// Start a new shell in `path` and show it in a new tab.
+    fn new_terminal(&mut self, ctx: &egui::Context, path: &Path) {
+        let launch = shell::launch(path, self.settings.terminal_prompt);
+        let wake = ctx.clone();
+        match Terminal::open(path, launch, move || wake.request_repaint()) {
+            Ok(terminal) => {
+                let number = 1 + self
+                    .tabs
+                    .iter()
+                    .filter_map(|t| match &t.kind {
+                        TabKind::Terminal { number, .. } => Some(*number),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let id = self.add_tab(TabKind::Terminal { number, terminal: Box::new(terminal) });
+                self.activate(id);
+            }
+            Err(e) => self.error(format!("Could not start the terminal: {e:#}")),
+        }
+    }
+
+    /// Read what every shell reported. When a prompt came back in the open
+    /// repository a command has finished, so the repository is read again.
+    fn poll_terminals(&mut self, actions: &mut Vec<Action>) {
+        let path = self.repo.as_ref().map(|r| r.path.clone());
+        let mut refresh = false;
+        for tab in &mut self.tabs {
+            if let TabKind::Terminal { terminal, .. } = &mut tab.kind {
+                terminal.poll();
+                refresh |= terminal.take_prompt_shown() && Some(&terminal.repo) == path.as_ref();
+            }
+        }
+        if refresh {
+            actions.push(Action::Refresh);
+        }
+    }
+
+    /// After the repository was read again: reload the diffs of uncommitted
+    /// files shown in tabs, and close those whose file has no changes left.
+    fn sync_diff_tabs(&mut self) {
+        let Some(r) = &self.repo else { return };
+        if r.generation == self.diffs_generation {
+            return;
+        }
+        self.diffs_generation = r.generation;
+        self.tabs.retain_mut(|tab| match &mut tab.kind {
+            TabKind::Diff(d) if d.source == DiffSource::Working => {
+                let changed = r.changes.iter().any(|c| c.path == d.path);
+                if changed {
+                    d.diff = load_diff(r, &d.source, &d.path);
+                }
+                changed
+            }
+            _ => true,
+        });
+        if !self.tabs.iter().any(|t| t.id == self.active) {
+            self.active = HOME;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pull requests
+    // -----------------------------------------------------------------------
+
+    fn pull_tab_mut(&mut self, number: u64) -> Option<&mut PullTab> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.kind {
+            TabKind::Pull(p) if p.number == number => Some(&mut **p),
+            _ => None,
+        })
+    }
+
+    /// Ask the Git host for something in the background.
+    fn start_forge(&mut self, ctx: &egui::Context, request: pulls::Request) {
+        let Some(r) = &self.repo else { return };
+        let (Some(remote), Some(url)) = (self.pulls.remote.clone(), r.remote_url.clone()) else { return };
+        if remote.provider().is_none() {
+            return;
+        }
+        let path = r.path.clone();
+        match &request {
+            pulls::Request::List(_) => self.pulls.list = Load::Loading,
+            pulls::Request::Detail(number) => {
+                if let Some(tab) = self.pull_tab_mut(*number) {
+                    tab.loading = true;
+                }
+            }
+            pulls::Request::Review { number, .. } => {
+                if let Some(tab) = self.pull_tab_mut(*number) {
+                    tab.sending = true;
+                }
+            }
+        }
+        let wake = ctx.clone();
+        pulls::spawn(path, url, remote, self.pulls.token.clone(), request, self.forge_tx.clone(), move || wake.request_repaint());
+    }
+
+    /// Load the list and every open pull request again (after a sign-in change).
+    fn reload_all_pulls(&mut self, ctx: &egui::Context) {
+        let numbers: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TabKind::Pull(p) => Some(p.number),
+                _ => None,
+            })
+            .collect();
+        let list_open = self.tabs.iter().any(|t| matches!(t.kind, TabKind::Page(Page::Pulls)));
+        if list_open || !matches!(self.pulls.list, Load::Idle) {
+            self.start_forge(ctx, pulls::Request::List(self.pulls.filter));
+        }
+        for number in numbers {
+            self.start_forge(ctx, pulls::Request::Detail(number));
+        }
+    }
+
+    fn poll_forge(&mut self, ctx: &egui::Context) {
+        while let Ok(reply) = self.forge_rx.try_recv() {
+            // An answer for a repository that was closed in the meantime.
+            if self.repo.as_ref().map(|r| &r.path) != Some(&reply.repo) {
+                continue;
+            }
+            match (reply.request, reply.result) {
+                (pulls::Request::List(filter), result) => {
+                    if filter == self.pulls.filter {
+                        self.pulls.list = match result {
+                            Ok(pulls::Payload::List(list)) => Load::Ready(list),
+                            Ok(_) => Load::Idle,
+                            Err(e) => Load::Failed(e),
+                        };
+                    }
+                }
+                (pulls::Request::Detail(number), result) => {
+                    if let Ok(pulls::Payload::Detail(detail)) = &result {
+                        if detail.viewer.is_some() {
+                            self.pulls.viewer = detail.viewer.clone();
+                        }
+                    }
+                    let Some(tab) = self.pull_tab_mut(number) else { continue };
+                    tab.loading = false;
+                    match result {
+                        Ok(pulls::Payload::Detail(detail)) => {
+                            tab.title = detail.summary.title.clone();
+                            tab.selected = tab.selected.min(detail.files.len().saturating_sub(1));
+                            tab.detail = Load::Ready(*detail);
+                        }
+                        Ok(_) => {}
+                        Err(e) => tab.detail = Load::Failed(e),
+                    }
+                }
+                (pulls::Request::Review { number, event, .. }, result) => {
+                    if let Some(tab) = self.pull_tab_mut(number) {
+                        tab.sending = false;
+                    }
+                    match result {
+                        Ok(_) => {
+                            self.info(match event {
+                                ReviewEvent::Approve => format!("Approved pull request #{number}"),
+                                ReviewEvent::RequestChanges => format!("Requested changes on pull request #{number}"),
+                                ReviewEvent::Comment => format!("Commented on pull request #{number}"),
+                            });
+                            self.start_forge(ctx, pulls::Request::Detail(number));
+                        }
+                        Err(e) => {
+                            self.dialog = Some(Dialog::Message { title: "The review was not sent".into(), text: e.message });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Ribbon: title row, commands of the active tab, tab strip
+    // -----------------------------------------------------------------------
+
+    fn ribbon(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let p = theme::pal(ui);
-        egui::Panel::left("nav")
+        egui::Panel::top("ribbon")
             .resizable(false)
-            .exact_size(196.0)
-            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::same(12)))
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(p.panel))
             .show(ui, |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    theme::logo(ui, 22.0);
-                    ui.label(RichText::new("gitsot").size(18.0).strong());
+                ui.spacing_mut().item_spacing.y = 0.0;
+                self.title_row(ui, actions);
+                self.command_row(ui, actions);
+                self.tab_row(ui, actions);
+            });
+    }
+
+    /// Logo, version and what is open: the repository, where it comes from
+    /// and where it is on this computer.
+    fn title_row(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 8, top: 6, bottom: 2 }).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                theme::logo(ui, 20.0);
+                ui.label(RichText::new("gitsot").size(16.0).strong());
+                ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).small().weak());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (label, page) in [("About", Page::About), ("Settings", Page::Settings), ("Repositories", Page::Repositories)] {
+                        if ui.add(egui::Button::new(label).frame_when_inactive(false)).clicked() {
+                            actions.push(Action::Show(page));
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.separator();
+                        let Some(r) = &self.repo else {
+                            ui.label(RichText::new("No repository open").weak());
+                            return;
+                        };
+                        ui.label(RichText::new(r.name()).strong());
+                        let source = match &r.remote_url {
+                            Some(url) => forge::Remote::parse(url).map(|remote| remote.display()).unwrap_or_else(|| url.clone()),
+                            None => "local only (no remote)".to_string(),
+                        };
+                        let source_label = egui::Label::new(RichText::new(format!("🌐 {source}")).weak()).truncate().sense(Sense::click());
+                        match &r.remote_url {
+                            Some(url) => {
+                                if ui.add(source_label).on_hover_text(format!("Source: {url}\nClick to copy")).clicked() {
+                                    actions.push(Action::CopyToClipboard(url.clone()));
+                                }
+                            }
+                            None => {
+                                ui.add(source_label).on_hover_text("This repository has no remote yet");
+                            }
+                        }
+                        let folder = egui::Label::new(RichText::new(format!("📁 {}", r.path.display())).weak()).truncate().sense(Sense::click());
+                        if ui.add(folder).on_hover_text("Current folder. Click to show it in the file manager").clicked() {
+                            actions.push(Action::RevealInFiles);
+                        }
+                    });
                 });
-                ui.add_space(14.0);
+            });
+        });
+    }
 
-                let page = self.page;
-                if theme::nav_item(ui, page == Page::Repositories, "Repositories", None).clicked() {
-                    actions.push(Action::GoTo(Page::Repositories));
+    /// The buttons of the active tab.
+    fn command_row(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let busy = self.busy.is_some();
+        let active = self.active;
+        let Self { tabs, repo, settings, pulls, .. } = self;
+        let Some(tab) = tabs.iter().find(|t| t.id == active) else { return };
+        let button = theme::ribbon_button;
+
+        egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 8, top: 2, bottom: 4 }).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(48.0);
+                ui.spacing_mut().item_spacing.x = 2.0;
+                match (&tab.kind, repo.as_mut()) {
+                    (TabKind::Home, Some(r)) => {
+                        remote_buttons(ui, r, busy, actions);
+                        ui.separator();
+                        let branch = button(ui, BRANCH_ICON, &format!("{} ⏷", shorten(&r.head.display_name(), 26)), true, false)
+                            .on_hover_text("Current branch: switch, create or delete branches");
+                        egui::Popup::menu(&branch)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| branch_menu(ui, r, actions));
+                        if button(ui, "⤵", "Merge", true, false).on_hover_text(format!("Merge another branch into {}", r.head.display_name())).clicked() {
+                            actions.push(Action::ShowMerge(None));
+                        }
+                        if r.repo.state() == git2::RepositoryState::Merge
+                            && button(ui, "↩", "Abort merge", !busy, true).on_hover_text("Undo the merge and go back to how your branch was").clicked()
+                        {
+                            actions.push(Action::Net(NetOp::MergeAbort));
+                        }
+                        ui.separator();
+                        if button(ui, ">_", "Terminal", true, false)
+                            .on_hover_text(format!("New terminal session in this repository, in a new tab ({TERMINAL_SHORTCUT} goes to the last one)"))
+                            .clicked()
+                        {
+                            actions.push(Action::NewTerminal);
+                        }
+                        if button(ui, "🔀", "Pull requests", r.remote_url.is_some(), false)
+                            .on_hover_text("Review, approve or request changes on pull requests")
+                            .clicked()
+                        {
+                            actions.push(Action::Show(Page::Pulls));
+                        }
+                        ui.separator();
+                        if button(ui, "🔄", "Refresh", true, false).on_hover_text("Read the repository again (F5)").clicked() {
+                            actions.push(Action::Refresh);
+                        }
+                        if button(ui, "📁", "Show folder", true, false).on_hover_text("Show this repository in the file manager").clicked() {
+                            actions.push(Action::RevealInFiles);
+                        }
+                        if button(ui, "✖", "Close repo", true, false).on_hover_text("Close this repository (its terminals end)").clicked() {
+                            actions.push(Action::CloseRepo);
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(4.0);
+                            segmented(ui, settings.history_view_tree, actions);
+                            ui.label(RichText::new("History").small().weak());
+                        });
+                    }
+                    (TabKind::Home, None) | (TabKind::Page(Page::Repositories), _) => {
+                        if button(ui, "📂", "Open folder", true, false).on_hover_text("Open a repository on this computer (Ctrl+O)").clicked() {
+                            actions.push(Action::OpenDialog);
+                        }
+                        if button(ui, "⬇", "Clone", true, false).on_hover_text("Clone a repository from a URL").clicked() {
+                            actions.push(Action::ShowClone);
+                        }
+                        if button(ui, "✚", "New", true, false).on_hover_text("Create a new repository").clicked() {
+                            actions.push(Action::InitDialog);
+                        }
+                        ui.separator();
+                        if button(ui, "▣", "New group", true, false).on_hover_text("Create a group, then drag repository cards into it").clicked() {
+                            actions.push(Action::AskGroupName(None));
+                        }
+                    }
+                    (TabKind::Diff(d), Some(r)) => {
+                        if d.source == DiffSource::Working {
+                            if let Some(change) = r.changes.iter().find(|c| c.path == d.path) {
+                                if change.fully_staged() {
+                                    if button(ui, "☐", "Unstage", true, false).on_hover_text("Leave this file out of the next commit").clicked() {
+                                        actions.push(Action::Unstage(vec![d.path.clone()]));
+                                    }
+                                } else if button(ui, "☑", "Stage", true, true).on_hover_text("Include this file in the next commit").clicked() {
+                                    actions.push(Action::Stage(vec![d.path.clone()]));
+                                }
+                                if button(ui, "🗑", "Discard", true, false).on_hover_text("Throw away the changes in this file…").clicked() {
+                                    actions.push(Action::AskDiscard(vec![change.clone()]));
+                                }
+                                ui.separator();
+                            }
+                        }
+                        if button(ui, "📋", "Copy path", true, false).clicked() {
+                            actions.push(Action::CopyToClipboard(d.path.clone()));
+                        }
+                        close_tab_button(ui, tab.id, actions);
+                    }
+                    (TabKind::Terminal { terminal, .. }, _) => {
+                        let same_repo = repo.as_ref().is_some_and(|r| r.path == terminal.repo);
+                        if button(ui, ">_", "New terminal", true, false).on_hover_text("Another session in the same folder, in a new tab").clicked() {
+                            actions.push(if same_repo { Action::NewTerminal } else { Action::OpenTerminal(terminal.repo.clone()) });
+                        }
+                        if button(ui, "⟳", "Restart", true, false).on_hover_text("End this shell and start a new one").clicked() {
+                            actions.push(Action::RestartTerminal);
+                        }
+                        close_tab_button(ui, tab.id, actions);
+                        ui.separator();
+                        ui.add_space(6.0);
+                        let state = if terminal.is_running() { terminal.shell.clone() } else { format!("{} (ended)", terminal.shell) };
+                        ui.add(egui::Label::new(RichText::new(format!("{state}  ·  {}", terminal.repo.display())).weak()).truncate());
+                    }
+                    (TabKind::Page(Page::Pulls), _) => {
+                        pulls::list_ribbon(ui, pulls, actions);
+                        close_tab_button(ui, tab.id, actions);
+                    }
+                    (TabKind::Pull(pull), _) => {
+                        pulls::pull_ribbon(ui, pull, pulls, actions);
+                        close_tab_button(ui, tab.id, actions);
+                    }
+                    _ => close_tab_button(ui, tab.id, actions),
                 }
+            });
+        });
+    }
 
-                if let Some(r) = &self.repo {
-                    ui.add_space(14.0);
-                    ui.add(egui::Label::new(RichText::new(r.name().to_uppercase()).small().weak()).truncate())
-                        .on_hover_text(r.path.display().to_string());
-                    if theme::nav_item(ui, page == Page::Changes, "Changes", Some(r.changes.len())).clicked() {
-                        actions.push(Action::GoTo(Page::Changes));
-                    }
-                    if theme::nav_item(ui, page == Page::History, "History", None).clicked() {
-                        actions.push(Action::GoTo(Page::History));
-                    }
-                    if theme::nav_item(ui, page == Page::Terminal, "Terminal", None)
-                        .on_hover_text(format!("A terminal in this repository ({TERMINAL_SHORTCUT})"))
-                        .clicked()
-                    {
-                        actions.push(Action::GoTo(Page::Terminal));
-                    }
-                }
-
-                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).small().weak());
-                    ui.add_space(4.0);
-                    if theme::nav_item(ui, page == Page::About, "About", None).clicked() {
-                        actions.push(Action::GoTo(Page::About));
-                    }
-                    if theme::nav_item(ui, page == Page::Settings, "Settings", None).clicked() {
-                        actions.push(Action::GoTo(Page::Settings));
+    fn tab_row(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let repo_path = self.repo.as_ref().map(|r| r.path.clone());
+        let home = match &self.repo {
+            Some(r) => r.name(),
+            None => "Repositories".to_string(),
+        };
+        egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 8, top: 0, bottom: 0 }).show(ui, |ui| {
+            egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for tab in &self.tabs {
+                        let (title, hint) = match &tab.kind {
+                            TabKind::Home => (format!("{BRANCH_ICON}  {home}"), "Changes, history and commit details. This tab stays open.".to_string()),
+                            TabKind::Page(Page::Repositories) => ("Repositories".to_string(), String::new()),
+                            TabKind::Page(Page::Settings) => ("Settings".to_string(), String::new()),
+                            TabKind::Page(Page::About) => ("About".to_string(), String::new()),
+                            TabKind::Page(Page::Pulls) => ("Pull requests".to_string(), String::new()),
+                            TabKind::Diff(d) => {
+                                let name = split_path(&d.path).0;
+                                match &d.source {
+                                    DiffSource::Working => (name.to_string(), format!("{} (uncommitted changes)", d.path)),
+                                    DiffSource::Commit(id) => (format!("{name} @ {}", git::short(*id)), format!("{} in commit {}", d.path, git::short(*id))),
+                                }
+                            }
+                            TabKind::Terminal { number, terminal } => {
+                                let mut title = format!(">_ Terminal {number}");
+                                // A session of a repository other than the open one.
+                                if Some(&terminal.repo) != repo_path.as_ref() {
+                                    title.push_str(&format!(" · {}", git::repo_name(&terminal.repo)));
+                                }
+                                if !terminal.is_running() {
+                                    title.push_str(" (ended)");
+                                }
+                                (title, terminal.repo.display().to_string())
+                            }
+                            TabKind::Pull(p) => (format!("#{} {}", p.number, shorten(&p.title, 28)), p.title.clone()),
+                        };
+                        let closable = tab.id != HOME;
+                        let active = tab.id == self.active;
+                        let out = theme::tab(ui, &title, active, closable);
+                        let middle = out.response.middle_clicked();
+                        if out.response.clicked() && !out.close {
+                            actions.push(Action::Activate(tab.id));
+                        }
+                        if !hint.is_empty() {
+                            out.response.on_hover_text(hint);
+                        }
+                        if closable && (out.close || middle) {
+                            actions.push(Action::CloseTab(tab.id));
+                        }
                     }
                 });
             });
+        });
+    }
+
+    /// The page of the active tab.
+    fn tab_content(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let index = match self.tabs.iter().position(|t| t.id == self.active) {
+            Some(index) => index,
+            None => {
+                self.active = HOME;
+                0
+            }
+        };
+        let page = match &self.tabs[index].kind {
+            TabKind::Home if self.repo.is_none() => Some(Page::Repositories),
+            TabKind::Page(page) => Some(*page),
+            _ => None,
+        };
+        match page {
+            Some(Page::Repositories) => return self.repositories_page(ui, actions),
+            Some(Page::Settings) => return self.settings_page(ui, actions),
+            Some(Page::About) => return about_page(ui),
+            Some(Page::Pulls) => return pulls::list_page(ui, &self.pulls, actions),
+            None => {}
+        }
+
+        let interactive = self.dialog.is_none();
+        // Files with a diff tab are marked in the list of changes.
+        let open_diffs: Vec<String> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TabKind::Diff(d) if d.source == DiffSource::Working => Some(d.path.clone()),
+                _ => None,
+            })
+            .collect();
+        let Self { tabs, repo, settings, pulls, .. } = self;
+        match (&mut tabs[index].kind, repo.as_mut()) {
+            (TabKind::Home, Some(r)) => workspace(ui, r, settings.history_view_tree, &open_diffs, actions),
+            (TabKind::Diff(d), Some(r)) => diff_page(ui, d, r),
+            (TabKind::Terminal { terminal, .. }, _) => {
+                let p = theme::pal(ui);
+                let fill = term_view::background(&p, ui.visuals().dark_mode);
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(fill)).show(ui, |ui| {
+                    if term_view::show(ui, terminal, settings.terminal_font_size, interactive).restart {
+                        actions.push(Action::RestartTerminal);
+                    }
+                });
+            }
+            (TabKind::Pull(pull), _) => pulls::pull_page(ui, pull, pulls, actions),
+            _ => {}
+        }
     }
 
     fn repositories_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -1250,18 +1959,6 @@ impl GitsotApp {
                     theme::page_header(ui, "Repositories", "Git repositories you work with. Drag a card onto a group to move it.");
                 });
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    if theme::primary(ui, "+ New").on_hover_text("Create a new repository").clicked() {
-                        actions.push(Action::InitDialog);
-                    }
-                    if theme::primary(ui, "Clone").on_hover_text("Clone a repository from a URL").clicked() {
-                        actions.push(Action::ShowClone);
-                    }
-                    if theme::primary(ui, "Open folder").on_hover_text("Open a repository on this computer (Ctrl+O)").clicked() {
-                        actions.push(Action::OpenDialog);
-                    }
-                    if theme::primary(ui, "+ Group").on_hover_text("Create a group, then drag repository cards into it").clicked() {
-                        actions.push(Action::AskGroupName(None));
-                    }
                     ui.add(TextEdit::singleline(&mut self.repo_filter).hint_text("Search repositories").desired_width(200.0));
                 });
             });
@@ -1404,152 +2101,13 @@ impl GitsotApp {
         });
     }
 
-    fn repo_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        let busy = self.busy.is_some();
-        let page = self.page;
-        let history_tree = self.settings.history_view_tree;
-        let Some(r) = self.repo.as_mut() else { return };
-
-        // Header: repository name, branch picker and remote buttons.
-        egui::Panel::top("repo_header")
-            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 20, right: 20, top: 14, bottom: 10 }))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(if page == Page::Changes { "Changes" } else { "History" }).size(24.0).strong());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        remote_buttons(ui, r, busy, actions);
-                        ui.add_space(4.0);
-                        ui.menu_button(RichText::new(format!("{BRANCH_ICON}  {}  ⏷", r.head.display_name())), |ui| {
-                            branch_menu(ui, r, actions)
-                        })
-                        .response
-                        .on_hover_text("Current branch: switch or create branches");
-                        ui.menu_button("☰", |ui| {
-                            if ui.button(format!("Merge into {}…", r.head.display_name())).clicked() {
-                                actions.push(Action::ShowMerge(None));
-                                ui.close();
-                            }
-                            if r.repo.state() == git2::RepositoryState::Merge && ui.button("Abort merge").clicked() {
-                                actions.push(Action::Net(NetOp::MergeAbort));
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("Refresh (F5)").clicked() {
-                                actions.push(Action::Refresh);
-                                ui.close();
-                            }
-                            if ui.button("Show in file manager").clicked() {
-                                actions.push(Action::RevealInFiles);
-                                ui.close();
-                            }
-                            if ui.button("Close repository").clicked() {
-                                actions.push(Action::CloseRepo);
-                                ui.close();
-                            }
-                        });
-                        if page == Page::History {
-                            ui.add_space(8.0);
-                            segmented(ui, history_tree, actions);
-                        }
-                    });
-                });
-                ui.add(
-                    egui::Label::new(RichText::new(format!("{}  ·  {}", r.name(), r.path.display())).weak()).truncate(),
-                );
-            });
-
-        match page {
-            Page::Changes => {
-                egui::Panel::left("changes_list")
-                    .resizable(true)
-                    .default_size(340.0)
-                    .min_size(240.0)
-                    .frame(egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 8, top: 4, bottom: 8 }))
-                    .show(ui, |ui| changes_sidebar(ui, r, actions));
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().inner_margin(egui::Margin::same(10)))
-                    .show(ui, |ui| changes_main(ui, r, actions));
-            }
-            _ => {
-                egui::Panel::left(if history_tree { "history_tree" } else { "history_list" })
-                    .resizable(true)
-                    .default_size(if history_tree { 520.0 } else { 360.0 })
-                    .min_size(240.0)
-                    .frame(egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 8, top: 4, bottom: 8 }))
-                    .show(ui, |ui| history_sidebar(ui, r, history_tree, actions));
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().inner_margin(egui::Margin::same(10)))
-                    .show(ui, |ui| history_main(ui, r, actions));
-            }
-        }
-    }
-
-    /// Start a terminal for `path`, replacing nothing: callers remove the old one first.
-    fn start_terminal(&mut self, ctx: &egui::Context, path: &Path) {
-        let launch = shell::launch(path, self.settings.terminal_prompt);
-        let ctx = ctx.clone();
-        match Terminal::open(path, launch, move || ctx.request_repaint()) {
-            Ok(terminal) => self.terminals.push(terminal),
-            Err(e) => self.error(format!("Could not start the terminal: {e:#}")),
-        }
-    }
-
-    fn terminal_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        let Some(path) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
-        let mut failed = false;
-        if !self.terminals.iter().any(|t| t.repo == path) {
-            let ctx = ui.ctx().clone();
-            self.start_terminal(&ctx, &path);
-            failed = !self.terminals.iter().any(|t| t.repo == path);
-        }
-        if failed {
-            // Don't try again on every frame; the error is in the status bar.
-            self.page = Page::Changes;
-            return;
-        }
-        let interactive = self.dialog.is_none();
-        let font_size = self.settings.terminal_font_size;
-        let Some(r) = self.repo.as_ref() else { return };
-        let Some(terminal) = self.terminals.iter_mut().find(|t| t.repo == path) else { return };
-        terminal.poll();
-        // The prompt came back: a command finished, so re-read the repository.
-        let refresh = terminal.take_prompt_shown();
-
-        egui::Panel::top("terminal_header")
-            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 20, right: 20, top: 14, bottom: 10 }))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Terminal").size(24.0).strong());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Restart").on_hover_text("End this shell and start a new one").clicked() {
-                            actions.push(Action::RestartTerminal);
-                        }
-                        let state = if terminal.is_running() { terminal.shell.clone() } else { format!("{} (ended)", terminal.shell) };
-                        ui.label(RichText::new(state).weak());
-                    });
-                });
-                ui.add(egui::Label::new(RichText::new(format!("{}  ·  {}", r.name(), r.path.display())).weak()).truncate());
-            });
-
-        let p = theme::pal(ui);
-        let fill = term_view::background(&p, ui.visuals().dark_mode);
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(fill)).show(ui, |ui| {
-            if term_view::show(ui, terminal, font_size, interactive).restart {
-                actions.push(Action::RestartTerminal);
-            }
-        });
-        if refresh {
-            actions.push(Action::Refresh);
-        }
-    }
-
     fn settings_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         page_frame(ui, |ui| {
-            theme::page_header(ui, "Settings", "Appearance, commit identities and Git.");
+            theme::page_header(ui, "Settings", "Appearance, commit identities, terminal and pull requests.");
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 ui.set_max_width(600.0);
 
-                theme::section(ui, "Appearance", "Colors of the sidebar, pages and dialogs.");
+                theme::section(ui, "Appearance", "Colors of the ribbon, pages and dialogs.");
                 ui.horizontal(|ui| {
                     let mut light = self.settings.light_mode;
                     ui.selectable_value(&mut light, false, "Dark");
@@ -1700,6 +2258,36 @@ impl GitsotApp {
                             .color(theme::ORANGE),
                     );
                 }
+
+                ui.add_space(20.0);
+                theme::section(
+                    ui,
+                    "Pull requests",
+                    "Review, approve or request changes on pull requests of the open repository. \
+                     GitHub and GitHub Enterprise are supported in this version.",
+                );
+                if self.curl_cli {
+                    ui.label(RichText::new("curl command found on PATH. Used to talk to the Git host.").weak());
+                } else {
+                    ui.label(RichText::new("curl command not found. It ships with Windows 10 and later and with macOS.").color(theme::ORANGE));
+                }
+                ui.label(
+                    RichText::new(
+                        "Reviews are made with the sign-in Git has saved for the repository's HTTPS remote, \
+                         or with an access token you enter for the session. gitsot never saves a token.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                for host in self.settings.github_hosts.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&host).monospace());
+                        ui.label(RichText::new("is treated as GitHub Enterprise").weak());
+                        if theme::icon_button(ui, theme::Icon::Delete, "Forget this host").clicked() {
+                            actions.push(Action::ForgetGitHubHost(host.clone()));
+                        }
+                    });
+                }
                 ui.add_space(12.0);
             });
         });
@@ -1753,6 +2341,16 @@ impl GitsotApp {
         let modal = egui::Modal::new(egui::Id::unique("gitsot-dialog")).show(ctx, |ui| {
             ui.set_width(440.0);
             match dialog {
+                Dialog::Review(form) => {
+                    if pulls::review_dialog(ui, form.number, form.event, &mut form.body, &self.pulls, actions) {
+                        close = true;
+                    }
+                }
+                Dialog::Token { token } => {
+                    if pulls::token_dialog(ui, token, &self.pulls, actions) {
+                        close = true;
+                    }
+                }
                 Dialog::Clone { url, parent, name, name_edited } => {
                     ui.heading("Clone a repository");
                     ui.add_space(8.0);
@@ -2220,17 +2818,17 @@ fn repo_card_body(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f
             identity_line(ui, st, true);
         }
         ui.add_space(6.0);
-        let label = if is_current { "Go to changes" } else { "Open" };
+        let label = if is_current { "Go to repository" } else { "Open" };
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let terminal = ui
                     .add_enabled(card.exists, egui::Button::new(">_  Terminal").min_size(Vec2::new(0.0, 28.0)))
-                    .on_hover_text("Open a terminal in this repository");
+                    .on_hover_text("Open a new terminal session in this repository");
                 if terminal.clicked() {
                     actions.push(Action::OpenTerminal(card.path.clone()));
                 }
                 if theme::primary_wide(ui, card.exists, label, 28.0).clicked() {
-                    actions.push(if is_current { Action::GoTo(Page::Changes) } else { Action::OpenPath(card.path.clone()) });
+                    actions.push(if is_current { Action::Activate(HOME) } else { Action::OpenPath(card.path.clone()) });
                 }
             });
         });
@@ -2285,43 +2883,41 @@ fn remote_host(url: &str) -> String {
 fn remote_buttons(ui: &mut egui::Ui, r: &RepoView, busy: bool, actions: &mut Vec<Action>) {
     let remote = r.head.has_remote;
     let on_branch = r.head.branch.is_some();
-    // Laid out right-to-left: Push, Pull, Fetch.
-    let (push_label, set_upstream) = if r.head.upstream.is_none() {
-        let remote_name = git::default_remote(&r.repo).unwrap_or_else(|| "origin".into());
-        let branch = r.head.branch.clone().unwrap_or_default();
-        ("⬆ Publish branch".to_string(), Some((remote_name, branch)))
-    } else if r.head.ahead > 0 {
-        (format!("⬆ Push ({})", r.head.ahead), None)
-    } else {
-        ("⬆ Push".to_string(), None)
-    };
-    let can_push = remote && !busy && on_branch && !r.head.short_id.is_empty();
-    if theme::primary_enabled(ui, can_push, push_label)
-        .on_hover_text("Upload your commits to the remote")
-        .clicked()
-    {
-        actions.push(Action::Net(NetOp::Push { set_upstream }));
-    }
-    let pull_label = if r.head.behind > 0 { format!("⬇ Pull ({})", r.head.behind) } else { "⬇ Pull".into() };
-    let can_pull = remote && !busy && r.head.upstream.is_some();
-    if theme::primary_enabled(ui, can_pull, pull_label)
-        .on_hover_text("Bring the remote's commits into this branch")
-        .clicked()
-    {
-        actions.push(Action::Net(NetOp::Pull));
-    }
-    if theme::primary_enabled(ui, remote && !busy, "⟳ Fetch")
+    let button = theme::ribbon_button;
+    if button(ui, "⟳", "Fetch", remote && !busy, false)
         .on_hover_text("Download new commits and branches from the remote")
         .clicked()
     {
         actions.push(Action::Net(NetOp::Fetch));
     }
-    if !remote {
-        ui.label(RichText::new("No remote").small().weak());
+    let pull_label = if r.head.behind > 0 { format!("Pull ({})", r.head.behind) } else { "Pull".into() };
+    let can_pull = remote && !busy && r.head.upstream.is_some();
+    if button(ui, "⬇", &pull_label, can_pull, r.head.behind > 0)
+        .on_hover_text("Bring the remote's commits into this branch")
+        .clicked()
+    {
+        actions.push(Action::Net(NetOp::Pull));
+    }
+    let (push_label, set_upstream) = if r.head.upstream.is_none() {
+        let remote_name = git::default_remote(&r.repo).unwrap_or_else(|| "origin".into());
+        let branch = r.head.branch.clone().unwrap_or_default();
+        ("Publish branch".to_string(), Some((remote_name, branch)))
+    } else if r.head.ahead > 0 {
+        (format!("Push ({})", r.head.ahead), None)
+    } else {
+        ("Push".to_string(), None)
+    };
+    let can_push = remote && !busy && on_branch && !r.head.short_id.is_empty();
+    let waiting = r.head.ahead > 0 || r.head.upstream.is_none();
+    if button(ui, "⬆", &push_label, can_push, waiting)
+        .on_hover_text(if remote { "Upload your commits to the remote" } else { "This repository has no remote" })
+        .clicked()
+    {
+        actions.push(Action::Net(NetOp::Push { set_upstream }));
     }
 }
 
-/// List / Tree switch for the history page.
+/// List / Tree switch for the history column.
 fn segmented(ui: &mut egui::Ui, tree: bool, actions: &mut Vec<Action>) {
     // Right-to-left layout: add "Tree" first so it ends up on the right.
     ui.spacing_mut().item_spacing.x = 2.0;
@@ -2437,7 +3033,8 @@ fn branch_menu(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
     ui.label(RichText::new("Click a branch to switch to it. Use the bin icon to delete one.").small().weak());
 }
 
-fn changes_sidebar(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
+/// First column: changed files to tick, and the commit box under them.
+fn changes_column(ui: &mut egui::Ui, r: &mut RepoView, open_diffs: &[String], actions: &mut Vec<Action>) {
     if r.repo.state() == git2::RepositoryState::Merge {
         egui::Panel::top("merge_banner").show(ui, |ui| {
             ui.add_space(4.0);
@@ -2454,7 +3051,7 @@ fn changes_sidebar(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action
             ui.add_space(2.0);
         });
     }
-    // Commit box at the bottom of the sidebar.
+    // Commit box at the bottom of the column.
     egui::Panel::bottom("commit_box").show(ui, |ui| {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -2499,6 +3096,8 @@ fn changes_sidebar(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action
         ui.add_space(4.0);
     });
 
+    theme::column_header(ui, "Changes");
+    ui.add_space(4.0);
     if r.changes.is_empty() {
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
@@ -2543,12 +3142,16 @@ fn changes_sidebar(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     kind_badge(ui, c.kind);
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        let selected = r.selected_change.as_deref() == Some(c.path.as_str());
-                        let row = file_row(ui, selected, &c.path);
+                        // Open in a tab already: shown as selected.
+                        let row = file_row(ui, open_diffs.contains(&c.path), &c.path);
                         if row.clicked() {
-                            actions.push(Action::SelectChange(c.path.clone()));
+                            actions.push(Action::OpenDiff(DiffSource::Working, c.path.clone()));
                         }
                         row.context_menu(|ui| {
+                            if ui.button("Open in a tab").clicked() {
+                                actions.push(Action::OpenDiff(DiffSource::Working, c.path.clone()));
+                                ui.close();
+                            }
                             if c.fully_staged() {
                                 if ui.button("Unstage").clicked() {
                                     actions.push(Action::Unstage(vec![c.path.clone()]));
@@ -2574,31 +3177,8 @@ fn changes_sidebar(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action
     });
 }
 
-fn changes_main(ui: &mut egui::Ui, r: &mut RepoView, _actions: &mut Vec<Action>) {
-    let Some(path) = r.selected_change.clone() else {
-        ui.centered_and_justified(|ui| {
-            ui.label(RichText::new("Select a file to see its changes").weak());
-        });
-        return;
-    };
-    let kind = r.changes.iter().find(|c| c.path == path).map(|c| c.kind);
-    ui.horizontal(|ui| {
-        if let Some(k) = kind {
-            kind_badge(ui, k);
-        }
-        ui.label(RichText::new(&path).strong().monospace());
-    });
-    ui.separator();
-    match &r.change_diff {
-        Some(Ok(d)) => diff_view(ui, d, "change_diff"),
-        Some(Err(e)) => {
-            ui.label(RichText::new(e).color(Color32::from_rgb(229, 83, 75)));
-        }
-        None => {}
-    }
-}
-
-fn history_sidebar(ui: &mut egui::Ui, r: &mut RepoView, tree: bool, actions: &mut Vec<Action>) {
+/// Second column: the commits, as a branch tree or a plain list.
+fn history_column(ui: &mut egui::Ui, r: &mut RepoView, tree: bool, actions: &mut Vec<Action>) {
     if r.history.is_empty() {
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
@@ -2737,7 +3317,10 @@ fn paint_ref_pill(painter: &egui::Painter, left_center: Pos2, label: &RefLabel, 
     rect.right()
 }
 
-fn history_main(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
+/// Third column: the selected commit, its files and the diff of one file.
+fn commit_column(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
+    theme::column_header(ui, "Commit");
+    ui.add_space(4.0);
     let Some(id) = r.selected_commit else {
         ui.centered_and_justified(|ui| {
             ui.label(RichText::new("Select a commit").weak());
@@ -2747,12 +3330,11 @@ fn history_main(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) 
     let Some(c) = r.history.iter().find(|c| c.id == id).cloned() else { return };
 
     egui::Panel::top("commit_header").show(ui, |ui| {
-        ui.add_space(4.0);
-        ui.label(RichText::new(&c.summary).heading());
+        ui.add(egui::Label::new(RichText::new(&c.summary).size(17.0).strong()).wrap());
         let body = c.message.split_once('\n').map(|x| x.1).unwrap_or("").trim();
         if !body.is_empty() {
-            egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-                ui.label(body);
+            egui::ScrollArea::vertical().id_salt("commit_body").max_height(100.0).show(ui, |ui| {
+                ui.add(egui::Label::new(body).wrap());
             });
         }
         ui.horizontal_wrapped(|ui| {
@@ -2770,19 +3352,22 @@ fn history_main(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) 
         ui.add_space(4.0);
     });
 
-    egui::Panel::left("commit_files")
+    egui::Panel::top("commit_files")
         .resizable(true)
-        .default_size(240.0)
-        .min_size(140.0)
+        .default_size(130.0)
+        .min_size(60.0)
         .show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("commit_files_list").auto_shrink(false).show(ui, |ui| {
                 for f in &r.commit_files {
                     ui.horizontal(|ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             kind_badge(ui, f.kind);
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 let sel = r.selected_commit_file.as_deref() == Some(f.path.as_str());
-                                if file_row(ui, sel, &f.path).clicked() {
+                                let row = file_row(ui, sel, &f.path).on_hover_text("Double-click to open in a tab");
+                                if row.double_clicked() {
+                                    actions.push(Action::OpenDiff(DiffSource::Commit(id), f.path.clone()));
+                                } else if row.clicked() {
                                     actions.push(Action::SelectCommitFile(f.path.clone()));
                                 }
                             });
@@ -2804,7 +3389,7 @@ fn history_main(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) 
 }
 
 /// Fast, virtualised diff renderer: only visible rows are laid out.
-fn diff_view(ui: &mut egui::Ui, diff: &FileDiff, id: &str) {
+pub(crate) fn diff_view(ui: &mut egui::Ui, diff: &FileDiff, id: &str) {
     if diff.binary {
         ui.centered_and_justified(|ui| {
             ui.label(RichText::new("Binary file: no text diff to show").weak());
