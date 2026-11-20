@@ -1,11 +1,13 @@
 //! gitsot core: everything that is not UI.
 //!
 //! Local Git operations (libgit2), network operations through the `git`
-//! command, identities and folder rules, the history graph layout, and the
-//! built-in terminal (shell, pseudo-terminal and screen). This crate has no
-//! dependency on the UI toolkit, so it can be tested and reused on its own.
+//! command, identities and folder rules, the history graph layout, pull
+//! requests on the Git host, and the built-in terminal (shell,
+//! pseudo-terminal and screen). This crate has no dependency on the UI
+//! toolkit, so it can be tested and reused on its own.
 
 pub mod cli;
+pub mod forge;
 pub mod git;
 pub mod graph;
 pub mod identity;

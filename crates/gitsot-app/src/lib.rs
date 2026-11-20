@@ -13,6 +13,7 @@
 //! * `gitsot_main()` opens the window and returns the process exit code.
 
 mod app;
+mod pulls;
 mod term_view;
 mod theme;
 
@@ -27,8 +28,8 @@ pub fn run() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("gitsot")
             .with_app_id("gitsot")
-            .with_inner_size([1200.0, 760.0])
-            .with_min_inner_size([860.0, 520.0])
+            .with_inner_size([1360.0, 820.0])
+            .with_min_inner_size([980.0, 560.0])
             .with_icon(eframe::egui::IconData { rgba: theme::icon_rgba(64), width: 64, height: 64 }),
         ..Default::default()
     };

@@ -6,15 +6,20 @@ Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](ht
 
 ## Features
 
-- **Repositories**: your repositories as cards showing the branch, host and the **name/email that commits will use**. Organise them into **groups**: click *+ Group*, then drag cards onto a group (or use the card menu ☰ → *Move to group…*). Rename or delete a group with the pencil and bin icons next to its name, and click its name to fold it. Open a local folder, clone from a URL, or create a new one.
-- **Changes**: see every changed file, tick the ones to include (stage), untick to unstage, and view a coloured diff.
+![Changes, history and the selected commit side by side](docs/workspace.png)
+
+- **One window, tabs and a ribbon**: there is no sidebar. The ribbon at the top shows the logo and version, the open repository with **where it comes from** (the remote) and **its folder**, and the buttons of the tab you are looking at. Under it is the tab strip.
+- **The first tab** is pinned and shows three columns: **Changes**, **History** and the selected **Commit**. No switching back and forth between changes and history.
+- **Changes**: tick the files to include (stage), untick to unstage. Click a file and its coloured diff opens in **its own tab**, with *Stage*, *Discard* and *Copy path* in the ribbon. Close it with the × on the tab, the middle mouse button or <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>W</kbd>. The tab closes by itself once the file is committed.
 - **Commit**: summary + description, then *Commit to &lt;branch&gt;* (or <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>Enter</kbd>). If your Git name/email are not set, Gitsot asks for them once.
 - **Discard**: right-click a file (or *Discard all…*) to throw away changes, with a confirmation.
-- **Branches**: switch, create, check out remote branches, and **merge** another branch into the current one (branch menu → *Merge into …*). If a merge has conflicts, the files are marked `!` in Changes; fix them and commit, or *Abort merge*. Delete local or remote branches with the bin icon in the branch menu (never the branch you are on).
+- **Branches**: switch, create, check out remote branches, and **merge** another branch into the current one (*Merge* in the ribbon). If a merge has conflicts, the files are marked `!` in Changes; fix them and commit, or *Abort merge*. Delete local or remote branches with the bin icon in the branch menu (never the branch you are on).
 - **Remote**: Fetch, Pull and Push, with ahead/behind counts. New branches get a *Publish branch* button.
-- **History**: switch between a **Tree** view (the default) (coloured branch graph with branch, remote and tag labels) and a simple **List**, and see each commit's files and diffs.
-- **Terminal**: every repository has a built-in terminal that opens right in its folder (the *Terminal* button on its card, *Terminal* in the sidebar, or <kbd>Ctrl</kbd>+<kbd>`</kbd>). See [Terminal](#terminal) below.
-- Sidebar navigation, Settings and About pages, light and dark theme, auto-refresh when the window regains focus, <kbd>F5</kbd> to refresh.
+- **History**: switch between a **Tree** view (the default) (coloured branch graph with branch, remote and tag labels) and a simple **List**. The third column shows the selected commit, its files and a diff; double-click a file to open it in a tab.
+- **Terminal**: *Terminal* in the ribbon starts a shell in the repository folder, in a new tab. Click it again for **another session in another tab**. See [Terminal](#terminal) below.
+- **Pull requests**: list them, read the description, files and reviews, then **approve**, **request changes** (reject) or **comment**, each pull request in its own tab. See [Pull requests](#pull-requests) below.
+- **Repositories**: your repositories as cards showing the branch, host and the **name/email that commits will use**. Organise them into **groups**: click *New group*, then drag cards onto a group (or use the card menu ☰ → *Move to group…*). Rename or delete a group with the pencil and bin icons next to its name, and click its name to fold it. Open a local folder, clone from a URL, or create a new one.
+- Settings and About pages (top right), light and dark theme, auto-refresh when the window regains focus, <kbd>F5</kbd> to refresh.
 
 ## Identities (work vs personal accounts)
 
@@ -27,13 +32,24 @@ Settings → **Folder rules** lets you say "every repository inside `C:\work\com
 
 Before a **commit**, if the email that would be used is different from the folder rule, Gitsot stops and offers *Use the rule's email and commit*, *Commit anyway*, or *Cancel*. Before a **push**, it checks every commit that is about to be sent and warns if any was authored with a different email.
 
-Gitsot works with any Git host (GitHub, GitLab, Bitbucket, Gitea, self-hosted servers, …). It never uses `gh` or any host-specific tool.
+Gitsot works with any Git host (GitHub, GitLab, Bitbucket, Gitea, self-hosted servers, …). It never uses `gh` or any host-specific tool. Only [pull requests](#pull-requests) need the host's own API.
 
 Clone, fetch, pull and push use the `git` command installed on your computer, so saved credentials and SSH keys keep working. Credential helpers are never allowed to open their own sign-in windows (such as Git Credential Manager's GitHub page). When an HTTPS remote needs a password and nothing is saved, Gitsot shows one plain *Sign in* dialog (username + password or access token), and your credential store remembers it if one is configured. Everything else is done in-process with libgit2.
 
+## Pull requests
+
+![A pull request in its own tab](docs/pull-request.png)
+
+Click **Pull requests** in the ribbon. The list opens in a tab (*Open*, *Closed*, *All*); click a pull request and it opens in its own tab with its description, reviews and comments, the changed files and their diffs. The ribbon then has **Approve**, **Request changes** and **Comment**. Each asks for your comment and shows **which account the review is made as** before anything is sent.
+
+- **Which account?** For an HTTPS remote, gitsot uses the sign-in Git has saved for that remote, so you review as the account that pushes. For an SSH remote (or to use another account) click *Sign in* and enter an access token. The token is kept in memory for the session and is never saved. The ribbon always shows *Reviewing as @name*.
+- **Which hosts?** Pull requests go through a small provider interface (`crates/gitsot-core/src/forge.rs`), so the rest of gitsot does not know which host it talks to. This version has a provider for **GitHub** (github.com and GitHub Enterprise; for an Enterprise server with its own name, open Pull requests once and click *… is a GitHub Enterprise server*). GitLab, Gitea / Forgejo and Bitbucket are recognised and reported as not supported yet.
+- **How?** Requests are sent with the `curl` command that ships with Windows 10+ and macOS, so the system certificates and proxy settings apply. gitsot still never uses `gh`.
+- Not in this version: comments on single lines of a diff, merging or closing a pull request, and creating one.
+
 ## Terminal
 
-Clone or open a repository, click **Terminal**, and you are in a shell inside that folder. No separate terminal window to open and `cd` around in.
+Clone or open a repository, click **Terminal**, and you are in a shell inside that folder, in a new tab. Every click starts another session in another tab. No separate terminal window to open and `cd` around in.
 
 ![The built-in terminal with the Gitsot prompt](docs/terminal.png)
 
@@ -55,7 +71,7 @@ The chips and icons are drawn by Gitsot itself: no Nerd Font, oh-my-posh or othe
 
 Good to know:
 
-- Each repository keeps its own terminal running while you look at other pages or repositories. *Restart* starts a fresh shell; *Close repository* ends it.
+- Terminals keep running while you look at other tabs or repositories. <kbd>Ctrl</kbd>+<kbd>`</kbd> jumps to the repository's last terminal (starting one if there is none) and back to the first tab. *Restart* starts a fresh shell in the same tab; closing the tab or the repository ends it.
 - When a command finishes, Changes and History are refreshed, so what you did in the terminal shows up right away.
 - Copy with <kbd>Ctrl</kbd>+<kbd>C</kbd> when text is selected (otherwise it interrupts, as usual) or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>; paste with <kbd>Ctrl</kbd>+<kbd>V</kbd> (<kbd>Cmd</kbd>+<kbd>C</kbd>/<kbd>V</kbd> on macOS). Scroll back with the mouse wheel or <kbd>Shift</kbd>+<kbd>PageUp</kbd>.
 
@@ -63,6 +79,7 @@ Good to know:
 
 - [Rust](https://rustup.rs) (stable)
 - [Git](https://git-scm.com) on your PATH (for clone/fetch/pull/push)
+- `curl` on your PATH for pull requests (already part of Windows 10+ and macOS)
 - **Windows**: the GNU toolchain is used (`x86_64-pc-windows-gnu`, not MSVC) and needs MinGW-w64 `gcc`:
   ```powershell
   winget install MSYS2.MSYS2
@@ -112,7 +129,7 @@ gitsot is a Cargo workspace with three crates, built the way desktop application
 
 ```
 gitsot.exe ──loads──▶ gitsot.dll ──contains──▶ gitsot-core
-(launcher)            (gitsot-app: the UI)     (Git, identities, terminal)
+(launcher)            (gitsot-app: the UI)     (Git, identities, terminal, pull requests)
 ```
 
 | Crate | Builds | What it does |
@@ -125,13 +142,15 @@ gitsot.exe ──loads──▶ gitsot.dll ──contains──▶ gitsot-core
 | --- | --- |
 | `crates/gitsot/src/main.rs` | The launcher |
 | `crates/gitsot-app/src/lib.rs` | Window setup and the exported entry points |
-| `crates/gitsot-app/src/app.rs` | All the UI: sidebar, repository cards, changes, history, settings, dialogs, diff viewer |
-| `crates/gitsot-app/src/theme.rs` | Colours, text sizes and widgets (same look as termker), logo, cards |
+| `crates/gitsot-app/src/app.rs` | Most of the UI: ribbon, tabs, the three columns (changes, history, commit), repository cards, settings, dialogs, diff viewer |
+| `crates/gitsot-app/src/pulls.rs` | Pull requests: the list tab, one tab per pull request, the review and sign-in dialogs |
+| `crates/gitsot-app/src/theme.rs` | Colours, text sizes and widgets (same look as termker), ribbon buttons, tabs, logo, cards |
 | `crates/gitsot-app/src/term_view.rs` | Draws the terminal, including the prompt's chips and icons, and handles keys and mouse |
 | `crates/gitsot-core/src/git.rs` | Local Git operations with libgit2 (status, diff, stage, commit, branches, history) |
 | `crates/gitsot-core/src/identity.rs` | Global/repository identities, folder rules (`includeIf`) and mismatch checks |
 | `crates/gitsot-core/src/graph.rs` | Lays out the history tree (lanes and branch lines) |
 | `crates/gitsot-core/src/cli.rs` | Network operations through the `git` command, run in the background |
+| `crates/gitsot-core/src/forge.rs` | Pull requests on the Git host: the provider interface, the GitHub provider, requests through `curl` |
 | `crates/gitsot-core/src/term.rs` | One built-in terminal: the shell in a pseudo-terminal and its screen (`alacritty_terminal`) |
 | `crates/gitsot-core/src/shell.rs` | Picks the shell (PowerShell / zsh / bash) and loads the Gitsot prompt into it |
 | `crates/gitsot-core/assets/prompt.ps1`, `prompt.sh` | The Gitsot prompt for PowerShell and for zsh/bash |
