@@ -117,7 +117,7 @@ Every build puts a ready-to-use release in `dist/gitsot`. It holds every file gi
 
 | Platform | Contents of `dist/gitsot` |
 | --- | --- |
-| Windows | `gitsot.exe` (the program you start) and `gitsot.dll` (the application) |
+| Windows | `gitsot.exe` (the program you start, with the gitsot icon) and `gitsot.dll` (the application) |
 | macOS | `gitsot.app`, with `libgitsot.dylib` inside `Contents/Frameworks` |
 | Linux | `gitsot` (the program you start) and `libgitsot.so` (the application) |
 
@@ -141,6 +141,7 @@ gitsot.exe ──loads──▶ gitsot.dll ──contains──▶ gitsot-core
 | File | What it does |
 | --- | --- |
 | `crates/gitsot/src/main.rs` | The launcher |
+| `crates/gitsot/build.rs`, `assets/gitsot.rc`, `assets/gitsot.ico` | Put the gitsot icon into `gitsot.exe` on Windows (compiled with MinGW's `windres`). The `.ico` is generated from the logo by a test in `theme.rs` |
 | `crates/gitsot-app/src/lib.rs` | Window setup and the exported entry points |
 | `crates/gitsot-app/src/app.rs` | Most of the UI: ribbon, tabs, the three columns (changes, history, commit), repository cards, settings, dialogs, diff viewer |
 | `crates/gitsot-app/src/pulls.rs` | Pull requests: the list tab, one tab per pull request, the review and sign-in dialogs |
