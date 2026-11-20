@@ -1243,7 +1243,7 @@ fn diff_page(ui: &mut egui::Ui, d: &DiffTab, r: &RepoView) {
         });
         ui.separator();
         match &d.diff {
-            Ok(diff) => diff_view(ui, diff, "tab_diff"),
+            Ok(diff) => diff_view(ui, diff, &format!("tab_diff/{}", d.path)),
             Err(e) => {
                 ui.label(RichText::new(e).color(theme::RED));
             }

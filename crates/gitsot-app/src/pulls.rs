@@ -411,7 +411,7 @@ pub fn pull_page(ui: &mut egui::Ui, tab: &mut PullTab, _pulls: &Pulls, actions: 
                 ui.label(RichText::new(format!("{} file(s)  ·  updated {}", detail.files.len(), relative_time(s.updated))).weak());
             });
             ui.separator();
-            egui::ScrollArea::vertical().id_salt("pull_conversation").auto_shrink(false).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt(("pull_conversation", tab.number)).auto_shrink(false).show(ui, |ui| {
                 theme::column_header(ui, "Description");
                 let body = strip_comments(&detail.body);
                 if body.trim().is_empty() {
@@ -455,7 +455,7 @@ pub fn pull_page(ui: &mut egui::Ui, tab: &mut PullTab, _pulls: &Pulls, actions: 
         .show(ui, |ui| {
             theme::column_header(ui, &format!("Files · {}", detail.files.len()));
             ui.add_space(4.0);
-            egui::ScrollArea::vertical().id_salt("pull_files_list").auto_shrink(false).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt(("pull_files_list", tab.number)).auto_shrink(false).show(ui, |ui| {
                 for (i, file) in detail.files.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -485,7 +485,8 @@ pub fn pull_page(ui: &mut egui::Ui, tab: &mut PullTab, _pulls: &Pulls, actions: 
                     ui.add(egui::Label::new(RichText::new(&file.path).strong().monospace()).truncate());
                 });
                 ui.separator();
-                diff_view(ui, &file.diff, "pull_diff");
+                // Each file keeps its own scroll position.
+                diff_view(ui, &file.diff, &format!("pull_diff/{}/{}", tab.number, file.path));
             }
             None => {
                 ui.centered_and_justified(|ui| {
@@ -517,7 +518,11 @@ fn strip_comments(text: &str) -> String {
 
 pub fn review_dialog(ui: &mut egui::Ui, number: u64, event: ReviewEvent, body: &mut String, pulls: &Pulls, actions: &mut Vec<Action>) -> bool {
     let mut close = false;
-    ui.heading(format!("{} pull request #{number}", event.label()));
+    ui.heading(match event {
+        ReviewEvent::Approve => format!("Approve pull request #{number}"),
+        ReviewEvent::RequestChanges => format!("Request changes on pull request #{number}"),
+        ReviewEvent::Comment => format!("Comment on pull request #{number}"),
+    });
     ui.add_space(4.0);
     ui.label(match event {
         ReviewEvent::Approve => "Tells the author the changes are good to merge.",
