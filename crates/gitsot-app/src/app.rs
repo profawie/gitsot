@@ -1216,7 +1216,11 @@ fn workspace(ui: &mut egui::Ui, r: &mut RepoView, history_tree: bool, open_diffs
         .frame(column(8, 10))
         .show(ui, |ui| commit_column(ui, r, actions));
     egui::CentralPanel::default().frame(column(8, 8)).show(ui, |ui| {
-        theme::column_header(ui, &format!("History · {}", if history_tree { "all branches".to_string() } else { r.head.display_name() }));
+        // The heading, with the List / Tree switch on its right.
+        ui.horizontal(|ui| {
+            theme::column_header(ui, &format!("History · {}", if history_tree { "all branches".to_string() } else { r.head.display_name() }));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| segmented(ui, history_tree, actions));
+        });
         ui.add_space(4.0);
         history_column(ui, r, history_tree, actions);
     });
@@ -1728,7 +1732,7 @@ impl GitsotApp {
     fn command_row(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let busy = self.busy.is_some();
         let active = self.active;
-        let Self { tabs, repo, settings, pulls, .. } = self;
+        let Self { tabs, repo, pulls, .. } = self;
         let Some(tab) = tabs.iter().find(|t| t.id == active) else { return };
         let button = theme::ribbon_button;
 
@@ -1776,11 +1780,6 @@ impl GitsotApp {
                         if button(ui, "✖", "Close repo", true, false).on_hover_text("Close this repository (its terminals end)").clicked() {
                             actions.push(Action::CloseRepo);
                         }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.add_space(4.0);
-                            segmented(ui, settings.history_view_tree, actions);
-                            ui.label(RichText::new("History").small().weak());
-                        });
                     }
                     (TabKind::Home, None) | (TabKind::Page(Page::Repositories), _) => {
                         if button(ui, "📂", "Open folder", true, false).on_hover_text("Open a repository on this computer (Ctrl+O)").clicked() {
@@ -2919,20 +2918,18 @@ fn remote_buttons(ui: &mut egui::Ui, r: &RepoView, busy: bool, actions: &mut Vec
 
 /// List / Tree switch for the history column.
 fn segmented(ui: &mut egui::Ui, tree: bool, actions: &mut Vec<Action>) {
+    // Small buttons with a gap between them, so the heading row stays low.
+    ui.spacing_mut().item_spacing.x = 6.0;
+    ui.spacing_mut().button_padding = Vec2::new(10.0, 2.0);
+    ui.spacing_mut().interact_size.y = 22.0;
     // Right-to-left layout: add "Tree" first so it ends up on the right.
-    ui.spacing_mut().item_spacing.x = 2.0;
-    for (label, value) in [("Tree", true), ("List", false)] {
+    for (label, value, hint) in [("Tree", true, "Every branch as a graph"), ("List", false, "Only the commits of the current branch")] {
         let selected = tree == value;
-        let resp = if selected {
-            theme::primary(ui, label)
-        } else {
-            ui.button(label)
-        };
-        if resp.clicked() && !selected {
+        let resp = if selected { theme::primary(ui, label) } else { ui.button(label) };
+        if resp.on_hover_text(hint).clicked() && !selected {
             actions.push(Action::SetHistoryTree(value));
         }
     }
-    ui.spacing_mut().item_spacing.x = 8.0;
 }
 
 fn about_page(ui: &mut egui::Ui) {
