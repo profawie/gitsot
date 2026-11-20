@@ -435,3 +435,101 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
     }
     px
 }
+
+/// The logo at `size` with smooth edges: drawn four times larger, then each
+/// pixel is the average of its 4 x 4 block.
+#[cfg(test)]
+fn smooth_icon(size: u32) -> Vec<u8> {
+    const SCALE: u32 = 4;
+    let big = icon_rgba(size * SCALE);
+    let mut out = vec![0u8; (size * size * 4) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            // Colours are weighted by their alpha so clear pixels add no black.
+            let mut sum = [0u32; 4];
+            for by in 0..SCALE {
+                for bx in 0..SCALE {
+                    let i = (((y * SCALE + by) * size * SCALE + x * SCALE + bx) * 4) as usize;
+                    let alpha = big[i + 3] as u32;
+                    for c in 0..3 {
+                        sum[c] += big[i + c] as u32 * alpha;
+                    }
+                    sum[3] += alpha;
+                }
+            }
+            let o = ((y * size + x) * 4) as usize;
+            for c in 0..3 {
+                out[o + c] = sum[c].checked_div(sum[3]).unwrap_or(0) as u8;
+            }
+            out[o + 3] = (sum[3] / (SCALE * SCALE)) as u8;
+        }
+    }
+    out
+}
+
+/// The logo as a Windows `.ico` file with the usual sizes, for the icon of
+/// `gitsot.exe`. Each size is drawn on its own rather than scaled from one.
+#[cfg(test)]
+fn icon_ico() -> Vec<u8> {
+    const SIZES: [u32; 6] = [16, 24, 32, 48, 64, 256];
+    let images: Vec<Vec<u8>> = SIZES
+        .iter()
+        .map(|&size| {
+            let rgba = smooth_icon(size);
+            // A bitmap without its file header: 40 bytes of info, the pixels
+            // bottom row first as BGRA, then a 1-bit mask (unused with alpha).
+            let mut image = Vec::new();
+            image.extend(40u32.to_le_bytes());
+            image.extend((size as i32).to_le_bytes());
+            image.extend((size as i32 * 2).to_le_bytes());
+            image.extend(1u16.to_le_bytes());
+            image.extend(32u16.to_le_bytes());
+            image.extend([0u8; 24]);
+            for y in (0..size).rev() {
+                for x in 0..size {
+                    let i = ((y * size + x) * 4) as usize;
+                    image.extend([rgba[i + 2], rgba[i + 1], rgba[i], rgba[i + 3]]);
+                }
+            }
+            let mask_row = size.div_ceil(32) * 4;
+            image.resize(image.len() + (mask_row * size) as usize, 0);
+            image
+        })
+        .collect();
+
+    let mut ico = Vec::new();
+    ico.extend([0u16.to_le_bytes(), 1u16.to_le_bytes(), (SIZES.len() as u16).to_le_bytes()].concat());
+    let mut offset = 6 + 16 * SIZES.len() as u32;
+    for (size, image) in SIZES.iter().zip(&images) {
+        // 256 is written as 0.
+        ico.extend([*size as u8, *size as u8, 0, 0]);
+        ico.extend(1u16.to_le_bytes());
+        ico.extend(32u16.to_le_bytes());
+        ico.extend((image.len() as u32).to_le_bytes());
+        ico.extend(offset.to_le_bytes());
+        offset += image.len() as u32;
+    }
+    for image in images {
+        ico.extend(image);
+    }
+    ico
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `crates/gitsot/assets/gitsot.ico` is made from the logo drawn here.
+    /// After changing the logo, write it again with
+    /// `GITSOT_WRITE_ICON=1 cargo test -p gitsot-app icon_file`.
+    #[test]
+    fn icon_file_matches_the_logo() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../gitsot/assets/gitsot.ico");
+        let ico = icon_ico();
+        if std::env::var_os("GITSOT_WRITE_ICON").is_some() {
+            std::fs::write(&path, &ico).unwrap();
+        }
+        let on_disk = std::fs::read(&path).expect("crates/gitsot/assets/gitsot.ico is missing");
+        assert!(on_disk == ico, "gitsot.ico is out of date: see the comment on this test");
+    }
+}
