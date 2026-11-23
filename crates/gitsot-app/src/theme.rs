@@ -211,6 +211,37 @@ pub fn primary_wide(ui: &mut Ui, enabled: bool, text: impl Into<String>, height:
     })
 }
 
+/// The way to the repository list, first thing in the ribbon: capitals in a
+/// box so it is not overlooked, filled while the list is what is shown.
+pub fn repositories_button(ui: &mut Ui, active: bool) -> Response {
+    let p = pal(ui);
+    let font = FontId::proportional(13.0);
+    let text = ui.painter().layout_no_wrap("REPOSITORIES".to_owned(), font, p.text);
+    // Room for the three-card mark in front of the word.
+    let size = Vec2::new(text.size().x + 46.0, 28.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let hot = response.hovered() || response.is_pointer_button_down_on();
+    let (fill, stroke, color) = match (active, hot) {
+        (true, _) => (p.accent, p.accent, Color32::WHITE),
+        (false, true) => (p.accent.gamma_multiply(0.25), p.accent_text, p.text),
+        (false, false) => (p.surface, p.accent_text.gamma_multiply(0.7), p.text),
+    };
+    let painter = ui.painter();
+    painter.rect(rect, 6.0, fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+    // A small stack of cards: the list of repositories.
+    let left = rect.left() + 12.0;
+    for dy in [-5.0, 0.0, 5.0] {
+        let bar = egui::Rect::from_min_size(Pos2::new(left, rect.center().y + dy - 1.25), Vec2::new(12.0, 2.5));
+        painter.rect_filled(bar, 1.0, color);
+    }
+    let pos = Pos2::new(left + 22.0, rect.center().y - text.size().y / 2.0);
+    // Drawn twice, half a point apart, for a bold look in a font with no bold face.
+    painter.galley_with_override_text_color(pos, text.clone(), color);
+    painter.galley_with_override_text_color(pos + Vec2::new(0.5, 0.0), text, color);
+    response
+}
+
 /// A ribbon command: an icon with its name under it. `accent` draws the
 /// icon in the accent colour, for the action that is waiting to be done.
 pub fn ribbon_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool, accent: bool) -> Response {
