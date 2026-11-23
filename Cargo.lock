@@ -894,14 +894,14 @@ dependencies = [
 
 [[package]]
 name = "gitsot"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "libloading",
 ]
 
 [[package]]
 name = "gitsot-app"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "gitsot-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

@@ -8,17 +8,17 @@ Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](ht
 
 ![Changes, history and the selected commit side by side](docs/workspace.png)
 
-- **One window, tabs and a ribbon**: there is no sidebar. The ribbon at the top shows the logo and version, the open repository with **where it comes from** (the remote) and **its folder**, and the buttons of the tab you are looking at. Under it is the tab strip.
+- **One window, tabs and a ribbon**: there is no sidebar. The ribbon at the top starts with the **REPOSITORIES** button (your list of repositories), then shows the open repository with **where it comes from** (the remote) and **its folder**, and the buttons of the tab you are looking at. The app name and version are on the right, next to Settings and About. Under it is the tab strip.
 - **The first tab** is pinned and shows three columns: **Changes**, **History** and the selected **Commit**. No switching back and forth between changes and history.
 - **Changes**: tick the files to include (stage), untick to unstage. Click a file and its coloured diff opens in **its own tab**, with *Stage*, *Discard* and *Copy path* in the ribbon. Close it with the × on the tab, the middle mouse button or <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>W</kbd>. The tab closes by itself once the file is committed.
 - **Commit**: summary + description, then *Commit to &lt;branch&gt;* (or <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>Enter</kbd>). If your Git name/email are not set, Gitsot asks for them once.
 - **Discard**: right-click a file (or *Discard all…*) to throw away changes, with a confirmation.
 - **Branches**: switch, create, check out remote branches, and **merge** another branch into the current one (*Merge* in the ribbon). If a merge has conflicts, the files are marked `!` in Changes; fix them and commit, or *Abort merge*. Delete local or remote branches with the bin icon in the branch menu (never the branch you are on).
 - **Remote**: Fetch, Pull and Push, with ahead/behind counts. New branches get a *Publish branch* button.
-- **History**: switch between a **Tree** view (the default) (coloured branch graph with branch, remote and tag labels) and a simple **List**. The third column shows the selected commit, its files and a diff; double-click a file to open it in a tab.
+- **History**: switch between a **Tree** view (the default) (coloured branch graph with branch, remote and tag labels) and a simple **List**. Rest the pointer on a commit to see its **commit date and time**. The third column shows the selected commit, its files and a diff; double-click a file to open it in a tab.
 - **Terminal**: *Terminal* in the ribbon starts a shell in the repository folder, in a new tab. Click it again for **another session in another tab**. See [Terminal](#terminal) below.
 - **Pull requests**: list them, read the description, files and reviews, then **approve**, **request changes** (reject) or **comment**, each pull request in its own tab. See [Pull requests](#pull-requests) below.
-- **Repositories**: your repositories as cards showing the branch, host and the **name/email that commits will use**. Organise them into **groups**: click *New group*, then drag cards onto a group (or use the card menu ☰ → *Move to group…*). Rename or delete a group with the pencil and bin icons next to its name, and click its name to fold it. Open a local folder, clone from a URL, or create a new one.
+- **Repositories**: your repositories as cards showing the branch, host and the **name/email that commits will use**. Organise them into **groups**: click *New group*, then drag cards onto a group: the card lifts off the page and follows the pointer, and a line under it says what dropping there does (or use the card menu ☰ → *Move to group…*). Rename or delete a group with the pencil and bin icons next to its name, and click its name to fold it. Open a local folder, clone from a URL, or create a new one.
 - Settings and About pages (top right), light and dark theme, auto-refresh when the window regains focus, <kbd>F5</kbd> to refresh.
 
 ## Identities (work vs personal accounts)
