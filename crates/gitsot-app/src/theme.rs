@@ -245,10 +245,30 @@ pub fn repositories_button(ui: &mut Ui, active: bool) -> Response {
 /// A ribbon command: an icon with its name under it. `accent` draws the
 /// icon in the accent colour, for the action that is waiting to be done.
 pub fn ribbon_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool, accent: bool) -> Response {
+    ribbon_button_badge(ui, icon, label, enabled, accent, None)
+}
+
+/// A count in a pill next to a ribbon button's icon: commits waiting to come
+/// in (arrow down) or to go out (arrow up).
+#[derive(Clone, Copy)]
+pub struct Badge {
+    pub count: usize,
+    pub up: bool,
+}
+
+/// A ribbon button with an optional commit count, such as `21 ↓` on Pull.
+pub fn ribbon_button_badge(ui: &mut Ui, icon: &str, label: &str, enabled: bool, accent: bool, badge: Option<Badge>) -> Response {
     let p = pal(ui);
     let label_font = FontId::proportional(12.0);
     let text = ui.painter().layout_no_wrap(label.to_owned(), label_font, p.text);
-    let size = Vec2::new((text.size().x + 18.0).max(56.0), 48.0);
+    let badge = badge.filter(|b| b.count > 0);
+    let count = badge.map(|b| ui.painter().layout_no_wrap(b.count.to_string(), FontId::proportional(11.0), p.text));
+    // Pill: padding, the number, a gap, the arrow, padding.
+    const ARROW_W: f32 = 7.0;
+    const ICON_W: f32 = 20.0;
+    let pill_w = count.as_ref().map(|c| 6.0 + c.size().x + 4.0 + ARROW_W + 6.0).unwrap_or(0.0);
+    let top_w = if count.is_some() { ICON_W + 4.0 + pill_w } else { ICON_W };
+    let size = Vec2::new((text.size().x + 18.0).max(top_w + 14.0).max(56.0), 48.0);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, response) = ui.allocate_exact_size(size, sense);
     let painter = ui.painter();
@@ -267,13 +287,31 @@ pub fn ribbon_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool, accent
         (true, true) => (p.accent_text, p.text),
         (true, false) => (p.text, p.text),
     };
+    let top_y = rect.top() + 17.0;
+    let top_left = rect.center().x - top_w / 2.0;
     painter.text(
-        Pos2::new(rect.center().x, rect.top() + 17.0),
+        Pos2::new(top_left + ICON_W / 2.0, top_y),
         egui::Align2::CENTER_CENTER,
         icon,
         FontId::proportional(18.0),
         icon_color,
     );
+    if let (Some(badge), Some(count)) = (badge, count) {
+        let pill = Rect::from_min_size(Pos2::new(top_left + ICON_W + 4.0, top_y - 8.0), Vec2::new(pill_w, 16.0));
+        let fade = if enabled { 1.0 } else { 0.5 };
+        painter.rect_filled(pill, 8.0, p.border.gamma_multiply(fade));
+        let ink = p.text.gamma_multiply(fade);
+        let count_w = count.size().x;
+        painter.galley_with_override_text_color(Pos2::new(pill.left() + 6.0, pill.center().y - count.size().y / 2.0), count, ink);
+        // The arrow is drawn, not typed: the UI font has no thin arrows.
+        let x = pill.left() + 6.0 + count_w + 4.0 + ARROW_W / 2.0;
+        let (tail, tip) = if badge.up { (pill.center().y + 4.0, pill.center().y - 4.0) } else { (pill.center().y - 4.0, pill.center().y + 4.0) };
+        let back = if badge.up { 3.0 } else { -3.0 };
+        let stroke = Stroke::new(1.3, ink);
+        painter.line_segment([Pos2::new(x, tail), Pos2::new(x, tip)], stroke);
+        painter.line_segment([Pos2::new(x - 3.0, tip + back), Pos2::new(x, tip)], stroke);
+        painter.line_segment([Pos2::new(x + 3.0, tip + back), Pos2::new(x, tip)], stroke);
+    }
     painter.galley_with_override_text_color(
         Pos2::new(rect.center().x - text.size().x / 2.0, rect.bottom() - text.size().y - 5.0),
         text,

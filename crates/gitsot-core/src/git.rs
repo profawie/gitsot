@@ -146,6 +146,10 @@ pub struct BranchInfo {
     pub name: String,
     pub is_head: bool,
     pub upstream: Option<String>,
+    /// Commits this branch has that its upstream does not.
+    pub ahead: usize,
+    /// Commits the upstream has that this branch does not.
+    pub behind: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -670,14 +674,18 @@ pub fn local_branches(repo: &Repository) -> Result<Vec<BranchInfo>> {
         let Some(name) = branch.name()?.map(str::to_string) else {
             continue;
         };
-        let upstream = branch
-            .upstream()
-            .ok()
-            .and_then(|u| u.name().ok().flatten().map(str::to_string));
+        let up = branch.upstream().ok();
+        let upstream = up.as_ref().and_then(|u| u.name().ok().flatten().map(str::to_string));
+        let (ahead, behind) = match (branch.get().target(), up.as_ref().and_then(|u| u.get().target())) {
+            (Some(local), Some(remote)) => repo.graph_ahead_behind(local, remote).unwrap_or((0, 0)),
+            _ => (0, 0),
+        };
         out.push(BranchInfo {
             is_head: branch.is_head(),
             name,
             upstream,
+            ahead,
+            behind,
         });
     }
     out.sort_by_key(|b| b.name.to_lowercase());
@@ -773,6 +781,50 @@ pub fn branch_merged(repo: &Repository, name: &str) -> bool {
         return false;
     };
     tip == head || repo.graph_descendant_of(head, tip).unwrap_or(false)
+}
+
+/// What merging a branch into the current branch would do, worked out
+/// without touching the working folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MergePreview {
+    /// Commits the branch has that the current branch does not.
+    pub commits: usize,
+    /// The current branch has no commits of its own, so it only moves forward
+    /// and no merge commit is made.
+    pub fast_forward: bool,
+    /// Files changed on both sides in a way Git cannot combine by itself.
+    pub conflicts: usize,
+}
+
+/// Preview merging `branch` (a local branch, or a remote one such as
+/// `origin/main`) into the current branch.
+pub fn merge_preview(repo: &Repository, branch: &str) -> Result<MergePreview> {
+    let theirs = repo
+        .find_reference(&format!("refs/heads/{branch}"))
+        .or_else(|_| repo.find_reference(&format!("refs/remotes/{branch}")))?
+        .peel_to_commit()?;
+    let ours = repo.head()?.peel_to_commit()?;
+    let (ahead, behind) = repo.graph_ahead_behind(ours.id(), theirs.id())?;
+    let mut preview = MergePreview { commits: behind, fast_forward: ahead == 0 && behind > 0, conflicts: 0 };
+    if ahead > 0 && behind > 0 {
+        let index = repo.merge_commits(&ours, &theirs, None)?;
+        let mut paths = std::collections::BTreeSet::new();
+        for c in index.conflicts()?.flatten() {
+            if let Some(entry) = c.our.or(c.their).or(c.ancestor) {
+                paths.insert(entry.path);
+            }
+        }
+        preview.conflicts = paths.len();
+    }
+    Ok(preview)
+}
+
+/// When the last fetch from a remote ran, in seconds since the Unix epoch.
+/// Git rewrites `FETCH_HEAD` on every fetch, also on one that fails.
+pub fn last_fetch_time(repo: &Repository) -> Option<i64> {
+    let modified = std::fs::metadata(repo.path().join("FETCH_HEAD")).ok()?.modified().ok()?;
+    let secs = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(secs).ok()
 }
 
 pub fn remote_url(repo: &Repository) -> Option<String> {
@@ -1020,4 +1072,70 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    fn write_commit(dir: &Path, repo: &Repository, file: &str, text: &str, message: &str) -> Oid {
+        std::fs::write(dir.join(file), text).unwrap();
+        stage(repo, &[file.into()]).unwrap();
+        commit(repo, message).unwrap()
+    }
+
+    #[test]
+    fn merge_preview_counts_commits_and_conflicts() {
+        let (dir, repo) = tmp_repo();
+        write_commit(&dir, &repo, "a.txt", "one\n", "First");
+        let main = head_info(&repo).branch.unwrap();
+
+        // Two commits on a branch, none on the current one: a fast-forward.
+        create_branch(&repo, "feature", true).unwrap();
+        write_commit(&dir, &repo, "a.txt", "feature\n", "Feature 1");
+        write_commit(&dir, &repo, "b.txt", "b\n", "Feature 2");
+        checkout_branch(&repo, &main).unwrap();
+        assert_eq!(merge_preview(&repo, "feature").unwrap(), MergePreview { commits: 2, fast_forward: true, conflicts: 0 });
+
+        // A commit of our own in another file: a real merge, no conflicts.
+        write_commit(&dir, &repo, "c.txt", "c\n", "Main 1");
+        assert_eq!(merge_preview(&repo, "feature").unwrap(), MergePreview { commits: 2, fast_forward: false, conflicts: 0 });
+
+        // The same file changed on both sides: one conflicted file.
+        write_commit(&dir, &repo, "a.txt", "main\n", "Main 2");
+        assert_eq!(merge_preview(&repo, "feature").unwrap(), MergePreview { commits: 2, fast_forward: false, conflicts: 1 });
+
+        // Nothing was touched by previewing.
+        assert!(status(&repo).unwrap().is_empty());
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+
+        // Everything of the other side is already here: nothing to merge.
+        checkout_branch(&repo, "feature").unwrap();
+        create_branch(&repo, "old", false).unwrap();
+        write_commit(&dir, &repo, "d.txt", "d\n", "Feature 3");
+        assert_eq!(merge_preview(&repo, "old").unwrap(), MergePreview::default());
+        assert!(merge_preview(&repo, "missing").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn branches_count_ahead_and_behind_their_upstream() {
+        let (dir, repo) = tmp_repo();
+        let first = write_commit(&dir, &repo, "a.txt", "one\n", "First");
+        let main = head_info(&repo).branch.unwrap();
+        // Pretend the remote is two commits further than where we started.
+        write_commit(&dir, &repo, "a.txt", "two\n", "Remote 1");
+        let tip = write_commit(&dir, &repo, "a.txt", "three\n", "Remote 2");
+        add_remote(&repo, "origin", "https://example.com/a/b.git").unwrap();
+        repo.reference(&format!("refs/remotes/origin/{main}"), tip, true, "test").unwrap();
+        repo.find_branch(&main, BranchType::Local).unwrap().set_upstream(Some(&format!("origin/{main}"))).unwrap();
+        // Our branch goes back to the first commit and gets one commit of its own.
+        repo.reset(&repo.find_object(first, None).unwrap(), git2::ResetType::Hard, None).unwrap();
+        write_commit(&dir, &repo, "b.txt", "mine\n", "Mine");
+
+        let branch = local_branches(&repo).unwrap().into_iter().find(|b| b.name == main).unwrap();
+        assert_eq!((branch.ahead, branch.behind), (1, 2));
+        let head = head_info(&repo);
+        assert_eq!((head.ahead, head.behind), (1, 2));
+        assert_eq!(merge_preview(&repo, &format!("origin/{main}")).unwrap().commits, 2);
+        assert!(last_fetch_time(&repo).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
