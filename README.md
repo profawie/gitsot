@@ -13,8 +13,8 @@ Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](ht
 - **Changes**: tick the files to include (stage), untick to unstage. Click a file and its coloured diff opens in **its own tab**, with *Stage*, *Discard* and *Copy path* in the ribbon. Close it with the × on the tab, the middle mouse button or <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>W</kbd>. The tab closes by itself once the file is committed.
 - **Commit**: summary + description, then *Commit to &lt;branch&gt;* (or <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>Enter</kbd>). If your Git name/email are not set, Gitsot asks for them once.
 - **Discard**: right-click a file (or *Discard all…*) to throw away changes, with a confirmation.
-- **Branches**: switch, create, check out remote branches, and **merge** another branch into the current one (*Merge* in the ribbon). If a merge has conflicts, the files are marked `!` in Changes; fix them and commit, or *Abort merge*. Delete local or remote branches with the bin icon in the branch menu (never the branch you are on).
-- **Remote**: Fetch, Pull and Push, with ahead/behind counts. New branches get a *Publish branch* button.
+- **Branches**: switch, create, check out remote branches, and **merge** another branch into the current one (*Merge* in the ribbon). Before you merge, Gitsot says what will happen: *This will merge 21 commits from main into my-branch*, or how many files will conflict. If a merge has conflicts, the files are marked `!` in Changes; fix them and commit, or *Abort merge*. Delete local or remote branches with the bin icon in the branch menu (never the branch you are on).
+- **Remote**: Fetch, Pull and Push, each with a **badge counting the commits that are waiting**. Gitsot checks the remote every 3 minutes and shows *Last updated on …* at the bottom. New branches get a *Publish branch* button. See [Staying up to date](#staying-up-to-date) below.
 - **Remotes**: *Remotes* in the ribbon shows where the repository is fetched from and pushed to. **Change a remote's URL** (for example after the project moved to another host or you switch between HTTPS and SSH), add another remote or remove one. See [Remotes](#remotes) below.
 - **History**: switch between a **Tree** view (the default) (coloured branch graph with branch, remote and tag labels) and a simple **List**. Rest the pointer on a commit to see its **commit date and time**. The third column shows the selected commit, its files and a diff; double-click a file to open it in a tab.
 - **Terminal**: *Terminal* in the ribbon starts a shell in the repository folder, in a new tab. Click it again for **another session in another tab**. See [Terminal](#terminal) below.
@@ -47,6 +47,29 @@ Click **Pull requests** in the ribbon. The list opens in a tab (*Open*, *Closed*
 - **Which hosts?** Pull requests go through a small provider interface (`crates/gitsot-core/src/forge.rs`), so the rest of gitsot does not know which host it talks to. This version has a provider for **GitHub** (github.com and GitHub Enterprise; for an Enterprise server with its own name, open Pull requests once and click *… is a GitHub Enterprise server*). GitLab, Gitea / Forgejo and Bitbucket are recognised and reported as not supported yet.
 - **How?** Requests are sent with the `curl` command that ships with Windows 10+ and macOS, so the system certificates and proxy settings apply. gitsot still never uses `gh`.
 - Not in this version: comments on single lines of a diff, merging or closing a pull request, and creating one.
+
+## Staying up to date
+
+![Badges on Fetch, Pull and Push, and the Last updated line](docs/updates.png)
+
+- **Pull** shows how many commits the remote has that your branch does not (`5 ↓`), **Push** how many of yours are not on the remote yet (`2 ↑`). **Fetch** counts the commits waiting on your *other* branches; rest the pointer on it to see which.
+- Every **3 minutes** Gitsot fetches from the remote in the background, so the numbers stay right without clicking anything. Only remote-tracking branches (`origin/…`) are updated: your own branches and files are never changed until you pull or merge.
+- The status bar at the bottom shows **Last updated on dd/mm/yyyy hh:mm:ss AM/PM**, with a small **Check** button to look right now.
+- **Which account does the background check use?** The one Git already has for that repository. It is the same `git fetch` as the Fetch button, run inside the repository, so your credential helper, folder rules (`includeIf`) and SSH keys decide, exactly as on the command line. It **never asks for a password**, never opens a sign-in window and never uses a password typed into Gitsot. If no saved sign-in works, it stops quietly and the status bar shows *Last check failed* (rest the pointer on it for the reason); click Fetch to sign in.
+- To fetch only when you ask, turn off *Check for new commits in the background* in Settings → **Remote updates**.
+
+### Merging
+
+![The Merge dialog says how many commits will be merged](docs/merge.png)
+
+Click **Merge**, pick a branch, and Gitsot works out the result before anything is changed:
+
+- *This will merge **21 commits** from **main** into **my-branch*** with a **Create a merge commit** button.
+- *There will be **2 conflicted files*** when both sides changed the same lines. You can still merge, then fix the files in Changes or *Abort merge*.
+- *Already up to date* when there is nothing to merge.
+- If the local branch you picked is behind its remote (for example `main` is behind `origin/main`), Gitsot says so and suggests the remote branch.
+
+When your branch has no commits of its own it simply moves forward (a fast-forward), and Git does not add an extra merge commit.
 
 ## Remotes
 

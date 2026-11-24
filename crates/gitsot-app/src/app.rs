@@ -9,7 +9,7 @@ use eframe::egui::{
 use git2::{Oid, Repository};
 use serde::{Deserialize, Serialize};
 
-use gitsot_core::cli::{self, Credentials, NetOp, NetResult};
+use gitsot_core::cli::{self, CheckResult, Credentials, NetOp, NetResult};
 use gitsot_core::forge::{self, Filter, ReviewEvent};
 use gitsot_core::git::{
     self, BranchInfo, ChangeKind, CommitFile, CommitInfo, FileChange, FileDiff, HeadInfo, LineKind, RefKind,
@@ -28,6 +28,8 @@ const MAX_RECENT: usize = 12;
 /// Git logo glyph from egui's bundled icon font, used as the "branch" icon.
 const BRANCH_ICON: &str = "\u{E625}";
 const TERMINAL_SHORTCUT: &str = "Ctrl+`";
+/// How often the remote is checked for new commits in the background.
+const CHECK_INTERVAL: Duration = Duration::from_secs(180);
 /// Id of the pinned first tab.
 const HOME: u64 = 0;
 
@@ -55,6 +57,8 @@ struct Settings {
     terminal_font_size: f32,
     /// Hosts the user marked as GitHub Enterprise, for pull requests.
     github_hosts: Vec<String>,
+    /// Fetch from the remote every few minutes, so the commit counts stay current.
+    background_check: bool,
 }
 
 impl Default for Settings {
@@ -71,6 +75,7 @@ impl Default for Settings {
             terminal_prompt: true,
             terminal_font_size: 14.0,
             github_hosts: Vec::new(),
+            background_check: true,
         }
     }
 }
@@ -126,6 +131,12 @@ struct RepoView {
     /// Folder identity rules (kept in sync by the app) and this repo's identity check.
     rules: Vec<FolderRule>,
     id_status: identity::Status,
+
+    /// When new commits were last fetched from the remote without an error
+    /// (seconds since the Unix epoch).
+    last_updated: Option<i64>,
+    /// Why the last background check failed, until one works again.
+    check_error: Option<String>,
 }
 
 impl RepoView {
@@ -156,8 +167,13 @@ impl RepoView {
             branch_filter: String::new(),
             rules: identity::rules(),
             id_status: identity::Status { effective: Identity::default(), source: identity::Source::Missing, rule: None },
+            last_updated: None,
+            check_error: None,
         };
         view.refresh()?;
+        // Git rewrites FETCH_HEAD on every fetch, so its age is a fair first
+        // guess until the app's own first check has run.
+        view.last_updated = git::last_fetch_time(&view.repo);
         Ok(view)
     }
 
@@ -347,7 +363,12 @@ enum Dialog {
     /// `remote` is set for a branch on a remote (`origin`, `feat/x`).
     ConfirmDeleteBranch { name: String, remote: Option<String>, unmerged: bool },
     /// Pick a branch to merge into the current one.
-    Merge { filter: String, selected: Option<String> },
+    Merge {
+        filter: String,
+        selected: Option<String>,
+        /// What merging the selected branch would do, and the branch it was worked out for.
+        preview: Option<(String, Result<git::MergePreview, String>)>,
+    },
     Message { title: String, text: String },
     SignIn { op: NetOp, host: String, username: String, password: String, retry: bool },
     /// About to commit or push with an identity that doesn't match the folder rule.
@@ -413,6 +434,9 @@ pub(crate) enum Action {
     AddRemote { name: String, url: String },
     RemoveRemote(String),
     Net(NetOp),
+    /// Look for new commits on the remote now (the small button in the status bar).
+    CheckNow,
+    SetBackgroundCheck(bool),
     NetWithCredentials(NetOp, Credentials),
     StartClone { url: String, parent: String, name: String },
     SelectCommit(Oid),
@@ -474,6 +498,15 @@ pub struct GitsotApp {
     busy: Option<String>,
     tx: Sender<NetResult>,
     rx: Receiver<NetResult>,
+    check_tx: Sender<CheckResult>,
+    check_rx: Receiver<CheckResult>,
+    /// The repository a background check is running in.
+    checking: Option<PathBuf>,
+    /// When the next background check is due.
+    next_check: Instant,
+    /// An operation the user started during a background check. It runs as
+    /// soon as the check ends, so two git commands never fight over the repository.
+    queued: Option<(NetOp, PathBuf, Option<Credentials>)>,
     git_cli: bool,
     /// The `curl` command is installed (used for pull requests).
     curl_cli: bool,
@@ -490,6 +523,7 @@ impl GitsotApp {
             .unwrap_or_default();
         let (tx, rx) = channel();
         let (forge_tx, forge_rx) = channel();
+        let (check_tx, check_rx) = channel();
         let mut app = Self {
             settings,
             repo: None,
@@ -514,6 +548,11 @@ impl GitsotApp {
             busy: None,
             tx,
             rx,
+            check_tx,
+            check_rx,
+            checking: None,
+            next_check: Instant::now(),
+            queued: None,
             git_cli: cli::git_available(),
             curl_cli: forge::curl_available(),
             was_focused: true,
@@ -576,6 +615,7 @@ impl GitsotApp {
                 self.pulls = Pulls::new(view.remote_url.as_deref(), &self.settings.github_hosts);
                 self.repo = Some(view);
                 self.active = HOME;
+                self.next_check = Instant::now();
                 self.reload_identity();
             }
             Err(e) => self.error(format!("{e:#}")),
@@ -778,6 +818,11 @@ impl GitsotApp {
             }
             Action::StartClone { url, parent, name } => self.start_clone(ctx, url, parent, name),
             Action::Net(op) => self.start_net(ctx, op, None),
+            Action::CheckNow => self.start_check(ctx),
+            Action::SetBackgroundCheck(on) => {
+                self.settings.background_check = on;
+                self.next_check = Instant::now();
+            }
             Action::NetWithCredentials(op, creds) => {
                 self.dialog = None;
                 self.last_username = creds.username.clone();
@@ -985,7 +1030,7 @@ impl GitsotApp {
                             return Ok(Some(format!("Switched to {local} (tracking {name})")));
                         }
                         Action::ShowMerge(selected) => {
-                            self.dialog = Some(Dialog::Merge { filter: String::new(), selected });
+                            self.dialog = Some(Dialog::Merge { filter: String::new(), selected, preview: None });
                             return Ok(None);
                         }
                         Action::ShowNewBranch => {
@@ -1113,8 +1158,70 @@ impl GitsotApp {
             _ => format!("{}…", op.label()),
         };
         self.busy = Some(detail);
+        if self.checking.is_some() && !matches!(op, NetOp::Clone { .. }) {
+            self.queued = Some((op, repo_path, creds));
+            return;
+        }
         let ctx = ctx.clone();
         cli::spawn(op, repo_path, creds, self.tx.clone(), move || ctx.request_repaint());
+    }
+
+    /// Look for new commits on the remote without getting in the user's way.
+    ///
+    /// The check runs git inside the open repository, with that repository's
+    /// own sign-in, and never with a password typed into Gitsot. See
+    /// [`cli::spawn_check`].
+    fn start_check(&mut self, ctx: &egui::Context) {
+        self.next_check = Instant::now() + CHECK_INTERVAL;
+        let Some(r) = &self.repo else { return };
+        if self.busy.is_some() || self.checking.is_some() || !self.git_cli || !r.head.has_remote {
+            return;
+        }
+        self.checking = Some(r.path.clone());
+        let ctx = ctx.clone();
+        cli::spawn_check(r.path.clone(), self.check_tx.clone(), move || ctx.request_repaint());
+    }
+
+    /// Start the background check when it is due, and take in its result.
+    fn poll_check(&mut self, ctx: &egui::Context) {
+        while let Ok(res) = self.check_rx.try_recv() {
+            self.checking = None;
+            let queued = self.queued.take();
+            if let Some(r) = self.repo.as_mut().filter(|r| r.path == res.repo) {
+                r.check_error = match res.result {
+                    Ok(()) => {
+                        r.last_updated = Some(chrono::Utc::now().timestamp());
+                        None
+                    }
+                    Err(e) if res.auth_failed => {
+                        Some(format!("No saved sign-in worked for this remote. Use Fetch to sign in.\n\n{e}"))
+                    }
+                    Err(e) => Some(e),
+                };
+                // A queued operation reads the repository again when it ends.
+                if queued.is_none() {
+                    self.refresh();
+                }
+            }
+            if let Some((op, repo, creds)) = queued {
+                let ctx = ctx.clone();
+                cli::spawn(op, repo, creds, self.tx.clone(), move || ctx.request_repaint());
+            }
+        }
+        let has_remote = self.repo.as_ref().is_some_and(|r| r.head.has_remote);
+        if !self.settings.background_check || !has_remote {
+            return;
+        }
+        let now = Instant::now();
+        if now >= self.next_check {
+            if self.busy.is_some() || self.checking.is_some() {
+                // Something is running: look again once it is done.
+                self.next_check = now + Duration::from_secs(5);
+            } else {
+                self.start_check(ctx);
+            }
+        }
+        ctx.request_repaint_after(self.next_check.saturating_duration_since(now) + Duration::from_millis(50));
     }
 
     fn poll_background(&mut self) {
@@ -1142,8 +1249,13 @@ impl GitsotApp {
                         NetOp::MergeAbort => "Merge aborted. Your branch is back to how it was.",
                         NetOp::Clone { .. } => unreachable!(),
                     };
+                    let fetched = matches!(op, NetOp::Fetch | NetOp::Pull);
                     let same_repo = self.repo.as_ref().map(|r| r.path == res.repo).unwrap_or(false);
                     if same_repo {
+                        if let (true, Some(r)) = (fetched, self.repo.as_mut()) {
+                            r.last_updated = Some(chrono::Utc::now().timestamp());
+                            r.check_error = None;
+                        }
                         self.refresh();
                     }
                     self.info(label);
@@ -1404,6 +1516,11 @@ pub(crate) fn relative_time(secs: i64) -> String {
     }
 }
 
+/// `1 commit`, `21 commits`.
+fn commits(n: usize) -> String {
+    if n == 1 { "1 commit".to_string() } else { format!("{n} commits") }
+}
+
 fn plural(n: i64, unit: &str) -> String {
     if n == 1 {
         format!("1 {unit} ago")
@@ -1478,12 +1595,13 @@ impl eframe::App for GitsotApp {
         let mut actions = Vec::new();
         self.handle_shortcuts(&ctx, &mut actions);
 
+        self.poll_check(&ctx);
         self.poll_forge(&ctx);
         self.poll_terminals(&mut actions);
         self.sync_diff_tabs();
 
         self.ribbon(ui, &mut actions);
-        self.status_bar(ui);
+        self.status_bar(ui, &mut actions);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::same(0)))
             .show(ui, |ui| self.tab_content(ui, &mut actions));
@@ -2372,6 +2490,29 @@ impl GitsotApp {
                 });
 
                 ui.add_space(20.0);
+                theme::section(
+                    ui,
+                    "Remote updates",
+                    "Gitsot fetches from the remote every 3 minutes, so Pull, Push and Fetch show how many commits are waiting.",
+                );
+                let mut check = self.settings.background_check;
+                if ui
+                    .checkbox(&mut check, "Check for new commits in the background")
+                    .on_hover_text("Turn it off to fetch only when you click Fetch, Pull or the Check button in the status bar.")
+                    .changed()
+                {
+                    actions.push(Action::SetBackgroundCheck(check));
+                }
+                ui.label(
+                    RichText::new(
+                        "The check uses the sign-in each repository already has saved in Git. It never asks for a password \
+                         and never uses one typed into Gitsot. When no saved sign-in works, it stops quietly and the status bar says so.",
+                    )
+                    .small()
+                    .weak(),
+                );
+
+                ui.add_space(20.0);
                 theme::section(ui, "Git command", "");
                 if self.git_cli {
                     ui.label(RichText::new("Found on PATH. Used for clone, fetch, pull and push.").weak());
@@ -2416,7 +2557,7 @@ impl GitsotApp {
         });
     }
 
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
+    fn status_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if let Some(b) = &self.busy {
@@ -2445,6 +2586,11 @@ impl GitsotApp {
                                 RichText::new(format!("⬆{} ⬇{}  {}", r.head.ahead, r.head.behind, up))
                                     .weak(),
                             );
+                        }
+                        if r.head.has_remote {
+                            ui.add_space(8.0);
+                            let checking = self.checking.as_ref() == Some(&r.path);
+                            last_updated(ui, r, checking, self.busy.is_some() || !self.git_cli, self.settings.background_check, actions);
                         }
                     }
                     if !self.git_cli {
@@ -2592,23 +2738,24 @@ impl GitsotApp {
                         }
                     });
                 }
-                Dialog::Merge { filter, selected } => {
+                Dialog::Merge { filter, selected, preview } => {
                     let Some(r) = self.repo.as_ref() else {
                         close = true;
                         return;
                     };
                     let current = r.head.display_name();
+                    ui.set_max_width(400.0);
                     ui.heading(format!("Merge into {current}"));
                     ui.add_space(4.0);
                     ui.label(RichText::new("Pick the branch whose changes you want to bring into your current branch.").weak());
                     ui.add_space(6.0);
-                    ui.add(TextEdit::singleline(filter).hint_text("Filter branches").desired_width(380.0));
+                    ui.add(TextEdit::singleline(filter).hint_text("Filter branches").desired_width(400.0));
                     let f = filter.to_lowercase();
                     let local = r.branches.iter().filter(|b| !b.is_head).map(|b| b.name.clone());
                     let remote = r.remote_branches.iter().cloned();
                     let names: Vec<String> = local.chain(remote).filter(|n| n.to_lowercase().contains(&f)).collect();
-                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                        ui.set_min_width(380.0);
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        ui.set_min_width(400.0);
                         if names.is_empty() {
                             ui.label(RichText::new("No other branches.").weak());
                         }
@@ -2619,18 +2766,43 @@ impl GitsotApp {
                             }
                         }
                     });
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        let label = match selected {
-                            Some(b) => format!("Merge {b} into {current}"),
-                            None => "Merge".to_string(),
-                        };
-                        if theme::primary_enabled(ui, selected.is_some(), label).clicked() {
-                            if let Some(b) = selected.clone() {
-                                actions.push(Action::Net(NetOp::Merge { branch: b }));
-                            }
-                            close = true;
+                    // Work out what the merge would do, once per selected branch.
+                    match selected.as_deref() {
+                        Some(b) if preview.as_ref().is_none_or(|(name, _)| name != b) => {
+                            *preview = Some((b.to_string(), git::merge_preview(&r.repo, b).map_err(|e| format!("{e:#}"))));
                         }
+                        Some(_) => {}
+                        None => *preview = None,
+                    }
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    let can_merge = merge_preview(ui, preview.as_ref(), &current);
+                    // A local branch that is behind its remote would merge old commits.
+                    let stale = selected.as_deref().and_then(|s| r.branches.iter().find(|b| b.name == s && b.behind > 0));
+                    if let Some((b, up)) = stale.and_then(|b| b.upstream.as_ref().map(|up| (b, up))) {
+                        ui.add_space(4.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Your local {} is {} behind {up}. Pick {up} in the list to merge the newest.",
+                                    b.name,
+                                    commits(b.behind)
+                                ))
+                                .small()
+                                .color(theme::ORANGE),
+                            );
+                        });
+                    }
+                    ui.add_space(8.0);
+                    if theme::primary_wide(ui, can_merge, "Create a merge commit", 32.0).clicked() {
+                        if let Some(b) = selected.clone() {
+                            actions.push(Action::Net(NetOp::Merge { branch: b }));
+                        }
+                        close = true;
+                    }
+                    ui.add_space(4.0);
+                    ui.vertical_centered(|ui| {
                         if ui.button("Cancel").clicked() {
                             close = true;
                         }
@@ -3181,18 +3353,32 @@ fn remote_host(url: &str) -> String {
 fn remote_buttons(ui: &mut egui::Ui, r: &RepoView, busy: bool, actions: &mut Vec<Action>) {
     let remote = r.head.has_remote;
     let on_branch = r.head.branch.is_some();
-    let button = theme::ribbon_button;
-    if button(ui, "⟳", "Fetch", remote && !busy, false)
-        .on_hover_text("Download new commits and branches from the remote")
-        .clicked()
-    {
+    let button = |ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool, accent: bool, count: usize, up: bool| {
+        theme::ribbon_button_badge(ui, icon, label, enabled, accent, Some(theme::Badge { count, up }))
+    };
+    // Fetch counts what waits on the other branches; Pull and Push count the current one.
+    let others: Vec<&BranchInfo> = r.branches.iter().filter(|b| !b.is_head && b.behind > 0).collect();
+    let elsewhere: usize = others.iter().map(|b| b.behind).sum();
+    let fetch_hint = if elsewhere > 0 {
+        let names: Vec<&str> = others.iter().take(4).map(|b| b.name.as_str()).collect();
+        let more = if others.len() > names.len() { ", …" } else { "" };
+        format!(
+            "Download new commits and branches from the remote\n{} waiting on your other branches: {}{more}",
+            commits(elsewhere),
+            names.join(", ")
+        )
+    } else {
+        "Download new commits and branches from the remote".to_string()
+    };
+    if button(ui, "⟳", "Fetch", remote && !busy, false, elsewhere, false).on_hover_text(fetch_hint).clicked() {
         actions.push(Action::Net(NetOp::Fetch));
     }
-    let pull_label = if r.head.behind > 0 { format!("Pull ({})", r.head.behind) } else { "Pull".into() };
     let can_pull = remote && !busy && r.head.upstream.is_some();
-    if button(ui, "⬇", &pull_label, can_pull, r.head.behind > 0)
-        .on_hover_text("Bring the remote's commits into this branch")
-        .clicked()
+    let pull_hint = match (&r.head.upstream, r.head.behind) {
+        (Some(up), n) if n > 0 => format!("Bring {} from {up} into this branch", commits(n)),
+        _ => "Bring the remote's commits into this branch".to_string(),
+    };
+    if button(ui, "⬇", "Pull", can_pull, r.head.behind > 0, r.head.behind, false).on_hover_text(pull_hint).clicked()
     {
         actions.push(Action::Net(NetOp::Pull));
     }
@@ -3200,19 +3386,125 @@ fn remote_buttons(ui: &mut egui::Ui, r: &RepoView, busy: bool, actions: &mut Vec
         let remote_name = git::default_remote(&r.repo).unwrap_or_else(|| "origin".into());
         let branch = r.head.branch.clone().unwrap_or_default();
         ("Publish branch".to_string(), Some((remote_name, branch)))
-    } else if r.head.ahead > 0 {
-        (format!("Push ({})", r.head.ahead), None)
     } else {
         ("Push".to_string(), None)
     };
     let can_push = remote && !busy && on_branch && !r.head.short_id.is_empty();
     let waiting = r.head.ahead > 0 || r.head.upstream.is_none();
-    if button(ui, "⬆", &push_label, can_push, waiting)
-        .on_hover_text(if remote { "Upload your commits to the remote" } else { "This repository has no remote" })
-        .clicked()
+    let push_hint = match (remote, &r.head.upstream, r.head.ahead) {
+        (false, ..) => "This repository has no remote".to_string(),
+        (true, Some(up), n) if n > 0 => format!("Upload {} to {up}", commits(n)),
+        (true, ..) => "Upload your commits to the remote".to_string(),
+    };
+    if button(ui, "⬆", &push_label, can_push, waiting, r.head.ahead, true).on_hover_text(push_hint).clicked()
     {
         actions.push(Action::Net(NetOp::Push { set_upstream }));
     }
+}
+
+/// "Last updated on 24/11/2026 09:44:17 PM" with a small button to check
+/// again, at the right of the status bar. Laid out right to left.
+fn last_updated(ui: &mut egui::Ui, r: &RepoView, checking: bool, busy: bool, automatic: bool, actions: &mut Vec<Action>) {
+    if let Some(e) = &r.check_error {
+        ui.label(RichText::new("⚠ Last check failed").color(theme::ORANGE)).on_hover_text(e);
+    }
+    let text = match (checking, r.last_updated) {
+        (true, _) => "Checking for new commits…".to_string(),
+        (false, Some(secs)) => format!("Last updated on {}", update_time(secs)),
+        (false, None) => "Not updated yet".to_string(),
+    };
+    let how = if automatic {
+        "When new commits were last fetched from the remote. Gitsot checks every 3 minutes."
+    } else {
+        "When new commits were last fetched from the remote. The automatic check is off in Settings."
+    };
+    ui.label(RichText::new(text).weak()).on_hover_text(how);
+    if checking {
+        ui.add(egui::Spinner::new().size(12.0));
+    } else if ui.add_enabled(!busy, egui::Button::new(RichText::new("⟳ Check").small()).small())
+        .on_hover_text("Check the remote for new commits now")
+        .clicked()
+    {
+        actions.push(Action::CheckNow);
+    }
+}
+
+/// `24/11/2026 09:44:17 PM` in local time.
+fn update_time(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%d/%m/%Y %I:%M:%S %p").to_string())
+        .unwrap_or_default()
+}
+
+/// The middle of the Merge dialog: a tick and "This will merge 21 commits
+/// from main into main_syukri", or why there is nothing to merge. Returns
+/// whether the merge can go ahead.
+fn merge_preview(ui: &mut egui::Ui, preview: Option<&(String, Result<git::MergePreview, String>)>, current: &str) -> bool {
+    let p = theme::pal(ui);
+    let green = Color32::from_rgb(63, 185, 80);
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    // Plain words dim, the numbers and branch names bright.
+    let sentence = |parts: &[(&str, bool)]| {
+        let mut job = egui::text::LayoutJob::default();
+        for (text, strong) in parts {
+            let color = if *strong { p.text } else { p.text_dim };
+            job.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
+        }
+        job.halign = Align::Center;
+        job
+    };
+    let mut ok = false;
+    ui.vertical_centered(|ui| match preview {
+        None => {
+            ui.add_space(22.0);
+            ui.label(RichText::new("Pick a branch to see what will be merged.").weak());
+        }
+        Some((_, Err(e))) => {
+            ui.label(RichText::new("⚠").size(16.0).color(theme::ORANGE));
+            ui.label(RichText::new(e).color(p.danger));
+        }
+        Some((branch, Ok(m))) if m.commits == 0 => {
+            ui.label(RichText::new("✔").size(16.0).color(green));
+            ui.label(sentence(&[(current, true), (" is already up to date with ", false), (branch, true)]));
+        }
+        Some((branch, Ok(m))) => {
+            ok = true;
+            let count = commits(m.commits);
+            if m.conflicts > 0 {
+                let files = if m.conflicts == 1 { "1 conflicted file".to_string() } else { format!("{} conflicted files", m.conflicts) };
+                ui.label(RichText::new("⚠").size(16.0).color(theme::ORANGE));
+                ui.label(sentence(&[
+                    ("There will be ", false),
+                    (&files, true),
+                    (" when merging ", false),
+                    (&count, true),
+                    (" from ", false),
+                    (branch, true),
+                    (" into ", false),
+                    (current, true),
+                ]));
+                ui.label(RichText::new("You fix them in Changes after the merge starts, or abort it.").small().weak());
+            } else {
+                ui.label(RichText::new("✔").size(16.0).color(green));
+                ui.label(sentence(&[
+                    ("This will merge ", false),
+                    (&count, true),
+                    (" from ", false),
+                    (branch, true),
+                    (" into ", false),
+                    (current, true),
+                ]));
+                if m.fast_forward {
+                    ui.label(
+                        RichText::new(format!("{current} has no commits of its own, so it just moves forward. No extra merge commit is needed."))
+                            .small()
+                            .weak(),
+                    );
+                }
+            }
+        }
+    });
+    ok
 }
 
 /// List / Tree switch for the history column.
@@ -3278,6 +3570,9 @@ fn branch_menu(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
                         let resp = ui.add(egui::Button::selectable(b.is_head, label).truncate());
                         let resp = match (&b.upstream, b.is_head) {
                             (_, true) => resp.on_hover_text("The branch you are on (switch to another branch to delete it)"),
+                            (Some(u), _) if b.ahead + b.behind > 0 => {
+                                resp.on_hover_text(format!("Tracks {u}: {} to pull, {} to push", b.behind, b.ahead))
+                            }
                             (Some(u), _) => resp.on_hover_text(format!("Tracks {u}")),
                             (None, _) => resp.on_hover_text("Not published yet"),
                         };

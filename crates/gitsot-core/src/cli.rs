@@ -233,6 +233,87 @@ pub fn spawn(
     });
 }
 
+/// How long a background check may take before it is stopped.
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Result of a background check for new commits on the remote.
+pub struct CheckResult {
+    pub repo: PathBuf,
+    pub result: Result<(), String>,
+    /// The remote wants a sign-in that is not saved anywhere.
+    pub auth_failed: bool,
+}
+
+/// Fetch from the remotes of `repo` on a background thread, without ever
+/// asking the user anything.
+///
+/// It is the same `git fetch` as the Fetch button, run inside the repository,
+/// so Git picks the identity that repository is set up with: its own
+/// credential helpers, `includeIf` sections, SSH command and keys. On top of
+/// that this never passes credentials typed into Gitsot's sign-in dialog,
+/// never lets a helper or SSH prompt, and stops after a minute. When no saved
+/// sign-in works it fails quietly and reports `auth_failed`.
+pub fn spawn_check(repo: PathBuf, tx: Sender<CheckResult>, wake: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        let result = check(&repo);
+        let auth_failed = matches!(&result, Err(e) if is_auth_error(e) || e.to_lowercase().contains("permission denied (publickey"));
+        let _ = tx.send(CheckResult { repo, result, auth_failed });
+        wake();
+    });
+}
+
+fn check(repo: &Path) -> Result<(), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut cmd = command(Some(repo));
+    // Stop SSH from asking for a passphrase or a host key on a terminal the
+    // app was started from. Only when the user has not chosen their own SSH
+    // command: that choice may be what selects the right key for this
+    // repository, and it must win.
+    let own_ssh = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || std::env::var_os("GIT_SSH").is_some()
+        || run(Some(repo), &["config", "--get", "core.sshCommand"], None).is_ok_and(|v| !v.is_empty());
+    if !own_ssh {
+        cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    }
+    let mut child = cmd
+        .args(["fetch", "--all", "--prune", "--quiet"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Could not run git: {e}"))?;
+    // Read errors on another thread, so a helper that outlives git and keeps
+    // the pipe open cannot hold the check up.
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    if let Some(mut stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            let _ = err_tx.send(text);
+        });
+    }
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > CHECK_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("The remote did not answer within a minute.".into());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => return Err(format!("Could not run git: {e}")),
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let text = err_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or_default();
+    let text = text.trim();
+    Err(if text.is_empty() { "git fetch failed without any output".to_string() } else { text.to_string() })
+}
+
 /// Guess a folder name from a clone URL, e.g. `https://host/user/project.git` -> `project`.
 pub fn name_from_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
@@ -266,4 +347,50 @@ mod tests {
         assert!(is_auth_error("fatal: Authentication failed for 'https://x/'"));
         assert!(!is_auth_error("fatal: not a git repository"));
     }
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn background_check_fetches_quietly_and_reports_failures() {
+        if !git_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("gitsot-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (origin, work, clone) = (root.join("origin.git"), root.join("work"), root.join("clone"));
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-q"]);
+        git(&root, &["clone", "-q", "origin.git", "work"]);
+        let commit = |n: &str| {
+            std::fs::write(work.join("a.txt"), n).unwrap();
+            git(&work, &["add", "a.txt"]);
+            git(&work, &["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q", "-m", n]);
+            git(&work, &["push", "-q", "origin", "HEAD"]);
+        };
+        commit("one");
+        git(&root, &["clone", "-q", "origin.git", "clone"]);
+        commit("two");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_check(clone.clone(), tx.clone(), || {});
+        let res = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(res.result, Ok(()));
+        assert!(!res.auth_failed);
+        // The new commit is known, and the branch itself was not moved.
+        let behind = Command::new("git").current_dir(&clone).args(["rev-list", "--count", "HEAD..@{u}"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&behind.stdout).trim(), "1");
+        assert!(clone.join(".git/FETCH_HEAD").exists());
+
+        // A remote that is gone fails without asking anything.
+        git(&clone, &["remote", "set-url", "origin", root.join("gone.git").to_str().unwrap()]);
+        spawn_check(clone.clone(), tx, || {});
+        let res = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        assert!(res.result.is_err());
+        assert!(!res.auth_failed);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 }
