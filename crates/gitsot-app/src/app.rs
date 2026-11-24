@@ -311,7 +311,32 @@ struct ReviewForm {
     body: String,
 }
 
+/// One remote being edited in the Remotes dialog.
+struct RemoteRow {
+    name: String,
+    /// What Git has now, to tell whether the fields were edited.
+    saved: git::RemoteInfo,
+    url: String,
+    /// Only shown when the remote has a separate push URL.
+    push: String,
+}
+
+impl RemoteRow {
+    fn edited(&self) -> bool {
+        self.url.trim() != self.saved.url || self.push.trim() != self.saved.push_url.as_deref().unwrap_or("")
+    }
+}
+
+fn remote_rows(repo: &Repository) -> Vec<RemoteRow> {
+    git::remotes(repo)
+        .into_iter()
+        .map(|info| RemoteRow { name: info.name.clone(), url: info.url.clone(), push: info.push_url.clone().unwrap_or_default(), saved: info })
+        .collect()
+}
+
 enum Dialog {
+    /// See, change, add and remove the remotes of the open repository.
+    Remotes { rows: Vec<RemoteRow>, new_name: String, new_url: String, confirm_remove: Option<String> },
     Review(ReviewForm),
     /// Access token for pull requests, kept for this session only.
     Token { token: String },
@@ -382,6 +407,11 @@ pub(crate) enum Action {
     AskDeleteRemoteBranch(String),
     ShowMerge(Option<String>),
     DeleteBranch(String),
+    ShowRemotes,
+    /// Change the URL (and the separate push URL, when there is one) of a remote.
+    SaveRemote { name: String, url: String, push: Option<String> },
+    AddRemote { name: String, url: String },
+    RemoveRemote(String),
     Net(NetOp),
     NetWithCredentials(NetOp, Credentials),
     StartClone { url: String, parent: String, name: String },
@@ -835,6 +865,9 @@ impl GitsotApp {
                 self.id_tab = IdTab::Repo;
                 self.apply(ctx, Action::Show(Page::Settings));
             }
+            action @ (Action::ShowRemotes | Action::SaveRemote { .. } | Action::AddRemote { .. } | Action::RemoveRemote(_)) => {
+                self.edit_remotes(action);
+            }
             Action::AskGroup(path) => {
                 let name = self.settings.groups.get(&path).cloned().unwrap_or_default();
                 self.dialog = Some(Dialog::SetGroup { path, name });
@@ -1148,6 +1181,50 @@ impl GitsotApp {
                     self.refresh();
                 }
             }
+        }
+    }
+
+    /// Open the Remotes dialog, or apply one change made in it.
+    ///
+    /// When the default remote ends up pointing somewhere else, everything
+    /// that belonged to the old address is dropped: open pull request tabs
+    /// and the pull request sign-in (it may be for another account or host).
+    fn edit_remotes(&mut self, action: Action) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(r) = self.repo.as_mut() else { return };
+        let before = r.remote_url.clone();
+        let result: anyhow::Result<Option<String>> = match &action {
+            Action::SaveRemote { name, url, push } => {
+                git::set_remote_url(&r.repo, name, url, push.as_deref()).map(|()| Some(format!("{name} now points to {}", url.trim())))
+            }
+            Action::AddRemote { name, url } => git::add_remote(&r.repo, name, url).map(|()| Some(format!("Added the remote {}", name.trim()))),
+            Action::RemoveRemote(name) => git::remove_remote(&r.repo, name).map(|()| Some(format!("Removed the remote {name}"))),
+            _ => Ok(None),
+        };
+        let refreshed = r.refresh();
+        let rows = remote_rows(&r.repo);
+        let after = r.remote_url.clone();
+        // Keep what was typed for a new remote when adding it failed.
+        let (new_name, new_url) = match (&action, &result) {
+            (Action::AddRemote { name, url }, Err(_)) => (name.clone(), url.clone()),
+            _ if rows.is_empty() => ("origin".to_string(), String::new()),
+            _ => (String::new(), String::new()),
+        };
+        self.dialog = Some(Dialog::Remotes { rows, new_name, new_url, confirm_remove: None });
+        if before != after {
+            self.tabs.retain(|t| !matches!(t.kind, TabKind::Page(Page::Pulls) | TabKind::Pull(_)));
+            if !self.tabs.iter().any(|t| t.id == self.active) {
+                self.active = HOME;
+            }
+            self.pulls = Pulls::new(after.as_deref(), &self.settings.github_hosts);
+            self.reload_cards();
+        }
+        match result.and_then(|msg| refreshed.map(|()| msg)) {
+            Ok(Some(msg)) => self.info(msg),
+            Ok(None) => {}
+            Err(e) => self.error(format!("{e:#}")),
         }
     }
 
@@ -1606,8 +1683,10 @@ impl GitsotApp {
 
     fn poll_forge(&mut self, ctx: &egui::Context) {
         while let Ok(reply) = self.forge_rx.try_recv() {
-            // An answer for a repository that was closed in the meantime.
-            if self.repo.as_ref().map(|r| &r.path) != Some(&reply.repo) {
+            // An answer for a repository that was closed in the meantime, or
+            // from a remote the repository no longer points at.
+            let current = self.repo.as_ref().filter(|r| r.path == reply.repo);
+            if current.and_then(|r| r.remote_url.as_deref()) != Some(reply.remote_url.as_str()) {
                 continue;
             }
             match (reply.request, reply.result) {
@@ -1720,12 +1799,15 @@ impl GitsotApp {
                         let source_label = egui::Label::new(RichText::new(format!("🌐 {source}")).weak()).truncate().sense(Sense::click());
                         match &r.remote_url {
                             Some(url) => {
-                                if ui.add(source_label).on_hover_text(format!("Source: {url}\nClick to copy")).clicked() {
+                                let hover = format!("Source: {url}\nClick to copy. Change it with Remotes in the ribbon");
+                                if ui.add(source_label).on_hover_text(hover).clicked() {
                                     actions.push(Action::CopyToClipboard(url.clone()));
                                 }
                             }
                             None => {
-                                ui.add(source_label).on_hover_text("This repository has no remote yet");
+                                if ui.add(source_label).on_hover_text("This repository has no remote yet. Click to add one").clicked() {
+                                    actions.push(Action::ShowRemotes);
+                                }
                             }
                         }
                         let folder = egui::Label::new(RichText::new(format!("📁 {}", r.path.display())).weak()).truncate().sense(Sense::click());
@@ -1753,6 +1835,12 @@ impl GitsotApp {
                 match (&tab.kind, repo.as_mut()) {
                     (TabKind::Home, Some(r)) => {
                         remote_buttons(ui, r, busy, actions);
+                        if button(ui, "🌐", "Remotes", !busy, false)
+                            .on_hover_text("Where this repository is fetched from and pushed to: change the URL, add or remove remotes")
+                            .clicked()
+                        {
+                            actions.push(Action::ShowRemotes);
+                        }
                         ui.separator();
                         let branch = button(ui, BRANCH_ICON, &format!("{} ⏷", shorten(&r.head.display_name(), 26)), true, false)
                             .on_hover_text("Current branch: switch, create or delete branches");
@@ -2374,8 +2462,13 @@ impl GitsotApp {
         let busy = self.busy.is_some();
 
         let modal = egui::Modal::new(egui::Id::unique("gitsot-dialog")).show(ctx, |ui| {
-            ui.set_width(440.0);
+            ui.set_width(if matches!(dialog, Dialog::Remotes { .. }) { 620.0 } else { 440.0 });
             match dialog {
+                Dialog::Remotes { rows, new_name, new_url, confirm_remove } => {
+                    if remotes_dialog(ui, rows, new_name, new_url, confirm_remove, busy, actions) {
+                        close = true;
+                    }
+                }
                 Dialog::Review(form) => {
                     if pulls::review_dialog(ui, form.number, form.event, &mut form.body, &self.pulls, actions) {
                         close = true;
@@ -2739,6 +2832,118 @@ impl GitsotApp {
             self.dialog = None;
         }
     }
+}
+
+/// The Remotes dialog. Returns true when it should close.
+fn remotes_dialog(
+    ui: &mut egui::Ui,
+    rows: &mut [RemoteRow],
+    new_name: &mut String,
+    new_url: &mut String,
+    confirm_remove: &mut Option<String>,
+    busy: bool,
+    actions: &mut Vec<Action>,
+) -> bool {
+    let mut close = false;
+    ui.heading("Remotes");
+    ui.label(RichText::new("Where this repository is fetched from and pushed to. Changing a URL only changes this computer's copy.").weak());
+    ui.add_space(8.0);
+
+    if rows.is_empty() {
+        ui.label(RichText::new("This repository has no remote yet. Add one below to fetch, pull and push.").weak());
+    }
+    for (i, row) in rows.iter_mut().enumerate() {
+        theme::card_frame(ui, false).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&row.name).strong());
+                if i == 0 {
+                    ui.label(RichText::new("default: used by Fetch, Publish branch and Pull requests").small().weak());
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::icon_button(ui, theme::Icon::Delete, "Remove this remote…").clicked() {
+                        *confirm_remove = Some(row.name.clone());
+                    }
+                });
+            });
+            let has_push = row.saved.push_url.is_some();
+            ui.horizontal(|ui| {
+                let edited = row.edited();
+                let valid = git::check_remote_url(&row.url).is_ok();
+                // Right to left so the URL field takes whatever width is left.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add_enabled(edited, egui::Button::new("Reset")).on_hover_text("Put back the saved URL").clicked() {
+                        row.url = row.saved.url.clone();
+                        row.push = row.saved.push_url.clone().unwrap_or_default();
+                    }
+                    let save = theme::primary_enabled(ui, edited && valid && !busy, "Save").on_hover_text("Use this URL from now on");
+                    let field = ui.add(
+                        TextEdit::singleline(&mut row.url)
+                            .hint_text("https://host/user/project.git or git@host:user/project.git")
+                            .desired_width(f32::INFINITY),
+                    );
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    if (save.clicked() || enter) && edited && valid && !busy {
+                        actions.push(Action::SaveRemote { name: row.name.clone(), url: row.url.clone(), push: has_push.then(|| row.push.clone()) });
+                    }
+                });
+            });
+            if has_push {
+                ui.add_space(2.0);
+                field(ui, "Push URL (pushes go here instead; leave empty to push to the URL above)", &mut row.push, "");
+            }
+            if row.edited() {
+                let (from, to) = (remote_host(&row.saved.url), remote_host(row.url.trim()));
+                let note = if git::check_remote_url(&row.url).is_err() {
+                    "Enter a URL to save.".to_string()
+                } else if from != to {
+                    format!("Host changes from {from} to {to}. Check that your commit email is right for the new host.")
+                } else {
+                    "Not saved yet.".to_string()
+                };
+                ui.label(RichText::new(note).small().color(theme::ORANGE));
+            }
+            if confirm_remove.as_deref() == Some(row.name.as_str()) {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "Remove '{}'? Its remote branches disappear from this computer and local branches stop following it. Nothing changes on the server.",
+                        row.name
+                    ));
+                });
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new(RichText::new("Remove").color(theme::RED))).clicked() {
+                        actions.push(Action::RemoveRemote(row.name.clone()));
+                    }
+                    if ui.button("Keep").clicked() {
+                        *confirm_remove = None;
+                    }
+                });
+            }
+        });
+        ui.add_space(6.0);
+    }
+
+    ui.add_space(4.0);
+    ui.label(RichText::new("Add a remote").strong());
+    ui.horizontal(|ui| {
+        let ready = !new_name.trim().is_empty() && git::check_remote_url(new_url).is_ok() && !busy;
+        ui.add(TextEdit::singleline(new_name).hint_text("Name, e.g. upstream").desired_width(160.0));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let add = theme::primary_enabled(ui, ready, "Add");
+            let field = ui.add(TextEdit::singleline(new_url).hint_text("URL").desired_width(f32::INFINITY));
+            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if (add.clicked() || enter) && ready {
+                actions.push(Action::AddRemote { name: new_name.clone(), url: new_url.clone() });
+            }
+        });
+    });
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        if ui.button("Close").clicked() {
+            close = true;
+        }
+    });
+    close
 }
 
 /// Labelled single-line text field that fills the available width (termker's field).
