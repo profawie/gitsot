@@ -15,6 +15,7 @@ Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](ht
 - **Discard**: right-click a file (or *Discard all…*) to throw away changes, with a confirmation.
 - **Branches**: switch, create, check out remote branches, and **merge** another branch into the current one (*Merge* in the ribbon). If a merge has conflicts, the files are marked `!` in Changes; fix them and commit, or *Abort merge*. Delete local or remote branches with the bin icon in the branch menu (never the branch you are on).
 - **Remote**: Fetch, Pull and Push, with ahead/behind counts. New branches get a *Publish branch* button.
+- **Remotes**: *Remotes* in the ribbon shows where the repository is fetched from and pushed to. **Change a remote's URL** (for example after the project moved to another host or you switch between HTTPS and SSH), add another remote or remove one. See [Remotes](#remotes) below.
 - **History**: switch between a **Tree** view (the default) (coloured branch graph with branch, remote and tag labels) and a simple **List**. Rest the pointer on a commit to see its **commit date and time**. The third column shows the selected commit, its files and a diff; double-click a file to open it in a tab.
 - **Terminal**: *Terminal* in the ribbon starts a shell in the repository folder, in a new tab. Click it again for **another session in another tab**. See [Terminal](#terminal) below.
 - **Pull requests**: list them, read the description, files and reviews, then **approve**, **request changes** (reject) or **comment**, each pull request in its own tab. See [Pull requests](#pull-requests) below.
@@ -46,6 +47,18 @@ Click **Pull requests** in the ribbon. The list opens in a tab (*Open*, *Closed*
 - **Which hosts?** Pull requests go through a small provider interface (`crates/gitsot-core/src/forge.rs`), so the rest of gitsot does not know which host it talks to. This version has a provider for **GitHub** (github.com and GitHub Enterprise; for an Enterprise server with its own name, open Pull requests once and click *… is a GitHub Enterprise server*). GitLab, Gitea / Forgejo and Bitbucket are recognised and reported as not supported yet.
 - **How?** Requests are sent with the `curl` command that ships with Windows 10+ and macOS, so the system certificates and proxy settings apply. gitsot still never uses `gh`.
 - Not in this version: comments on single lines of a diff, merging or closing a pull request, and creating one.
+
+## Remotes
+
+![The Remotes dialog with an edited URL](docs/remotes.png)
+
+Click **Remotes** in the ribbon (or the *local only* label at the top when the repository has no remote yet).
+
+- **Change a URL**: edit the address and click *Save*. Any address Git understands works: `https://…`, `ssh://…`, `git@host:user/project.git` or a folder. If the host changes, Gitsot says so before you save, as a reminder to check that your commit email is right for the new host.
+- **Add** a remote with a name and a URL, or **remove** one with the bin icon (after a confirmation). Removing only forgets the remote on this computer: nothing changes on the server.
+- The first remote in the list (`origin` when there is one) is the default: Fetch, *Publish branch* and Pull requests use it.
+- If a remote has a separate push URL (`pushurl`), it is shown and can be edited or cleared too.
+- When the default remote's URL changes, open pull request tabs are closed and the pull request sign-in is forgotten, so a token for the old host or account is never sent to the new one.
 
 ## Terminal
 

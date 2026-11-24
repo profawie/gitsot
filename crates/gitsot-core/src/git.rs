@@ -790,6 +790,101 @@ pub fn default_remote(repo: &Repository) -> Option<String> {
     names.into_iter().next()
 }
 
+/// One configured remote. `push_url` is only set when pushes go to a
+/// different address than fetches (`remote.<name>.pushurl`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteInfo {
+    pub name: String,
+    pub url: String,
+    pub push_url: Option<String>,
+}
+
+/// Every remote of the repository, the default one (see [`default_remote`]) first.
+pub fn remotes(repo: &Repository) -> Vec<RemoteInfo> {
+    let Ok(names) = repo.remotes() else { return Vec::new() };
+    let mut out: Vec<RemoteInfo> = names
+        .iter()
+        .filter_map(|n| n.ok().flatten())
+        .filter_map(|name| {
+            let remote = repo.find_remote(name).ok()?;
+            Some(RemoteInfo {
+                name: name.to_string(),
+                url: remote.url().map(str::to_string).unwrap_or_default(),
+                push_url: remote.pushurl().ok().flatten().map(str::to_string),
+            })
+        })
+        .collect();
+    if let Some(i) = out.iter().position(|r| r.name == "origin") {
+        out[..=i].rotate_right(1);
+    }
+    out
+}
+
+/// Tidy a remote URL typed by the user, or say what is wrong with it.
+/// Any address Git understands is accepted (https, ssh, `user@host:path`, a
+/// local folder, ...): only values that cannot be an address are refused.
+pub fn check_remote_url(url: &str) -> Result<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        bail!("The URL is empty");
+    }
+    if url.starts_with('-') {
+        bail!("A URL cannot start with '-'");
+    }
+    if url.chars().any(char::is_control) {
+        bail!("The URL contains characters that are not allowed");
+    }
+    Ok(url.to_string())
+}
+
+fn check_remote_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("The remote needs a name, for example origin");
+    }
+    if name.starts_with('-') || !git2::Remote::is_valid_name(name) {
+        bail!("'{name}' is not a valid remote name (use letters, digits, '-' and '_')");
+    }
+    Ok(name)
+}
+
+/// Add a remote and set it up to fetch all its branches.
+pub fn add_remote(repo: &Repository, name: &str, url: &str) -> Result<()> {
+    let name = check_remote_name(name)?;
+    let url = check_remote_url(url)?;
+    if repo.find_remote(name).is_ok() {
+        bail!("A remote named '{name}' already exists");
+    }
+    repo.remote(name, &url).with_context(|| format!("Could not add the remote '{name}'"))?;
+    Ok(())
+}
+
+/// Change where an existing remote points. `push_url` is the separate
+/// address for pushes; `None` (or blank) means pushes use `url` too.
+pub fn set_remote_url(repo: &Repository, name: &str, url: &str, push_url: Option<&str>) -> Result<()> {
+    let url = check_remote_url(url)?;
+    let push_url = match push_url.map(str::trim) {
+        Some(p) if !p.is_empty() => Some(check_remote_url(p)?),
+        _ => None,
+    };
+    let remote = repo.find_remote(name).with_context(|| format!("There is no remote named '{name}'"))?;
+    let had_push_url = remote.pushurl_bytes().is_some();
+    repo.remote_set_url(name, &url).with_context(|| format!("Could not change the URL of '{name}'"))?;
+    // Clearing a push URL that is not there is an error in libgit2.
+    if push_url.is_some() || had_push_url {
+        repo.remote_set_pushurl(name, push_url.as_deref())
+            .with_context(|| format!("Could not change the push URL of '{name}'"))?;
+    }
+    Ok(())
+}
+
+/// Remove a remote, with its remote-tracking branches and the upstream
+/// settings of local branches that followed it. Nothing on the server changes.
+pub fn remove_remote(repo: &Repository, name: &str) -> Result<()> {
+    repo.remote_delete(name).with_context(|| format!("Could not remove the remote '{name}'"))?;
+    Ok(())
+}
+
 /// Is `oid` an object of type commit? Used to validate selections after refresh.
 pub fn commit_exists(repo: &Repository, oid: Oid) -> bool {
     repo.find_object(oid, Some(ObjectType::Commit)).is_ok()
@@ -884,6 +979,44 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "hello\n");
         delete_branch(&repo, "feature").unwrap();
         assert_eq!(local_branches(&repo).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remotes_add_change_remove() {
+        let (dir, repo) = tmp_repo();
+        assert!(remotes(&repo).is_empty());
+        assert_eq!(remote_url(&repo), None);
+
+        add_remote(&repo, "upstream", " https://example.com/team/app.git ").unwrap();
+        add_remote(&repo, "origin", "git@example.com:me/app.git").unwrap();
+        let list = remotes(&repo);
+        assert_eq!(list.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["origin", "upstream"]);
+        assert_eq!(list[1].url, "https://example.com/team/app.git");
+        assert_eq!(list[0].push_url, None);
+
+        assert!(add_remote(&repo, "origin", "https://example.com/x.git").is_err());
+        assert!(add_remote(&repo, "bad name", "https://example.com/x.git").is_err());
+        assert!(add_remote(&repo, "-x", "https://example.com/x.git").is_err());
+        assert!(add_remote(&repo, "other", "  ").is_err());
+        assert!(add_remote(&repo, "other", "--upload-pack=evil").is_err());
+        assert!(check_remote_url("https://a\nb").is_err());
+
+        set_remote_url(&repo, "origin", "https://git.company.example/me/app.git", None).unwrap();
+        assert_eq!(remote_url(&repo).as_deref(), Some("https://git.company.example/me/app.git"));
+        assert!(set_remote_url(&repo, "origin", "", None).is_err());
+        assert!(set_remote_url(&repo, "nope", "https://example.com/x.git", None).is_err());
+        assert_eq!(remote_url(&repo).as_deref(), Some("https://git.company.example/me/app.git"));
+
+        set_remote_url(&repo, "origin", "https://a.example/app.git", Some("git@a.example:app.git")).unwrap();
+        assert_eq!(remotes(&repo)[0].push_url.as_deref(), Some("git@a.example:app.git"));
+        set_remote_url(&repo, "origin", "https://a.example/app.git", Some(" ")).unwrap();
+        assert_eq!(remotes(&repo)[0].push_url, None);
+
+        remove_remote(&repo, "origin").unwrap();
+        assert_eq!(default_remote(&repo).as_deref(), Some("upstream"));
+        assert!(remove_remote(&repo, "origin").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

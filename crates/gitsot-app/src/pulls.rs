@@ -93,6 +93,8 @@ pub enum Payload {
 pub struct Reply {
     /// The repository the request was made for.
     pub repo: PathBuf,
+    /// The remote URL the request was sent to.
+    pub remote_url: String,
     pub request: Request,
     pub result: forge::Result<Payload>,
 }
@@ -122,7 +124,7 @@ pub fn spawn(
                 Request::Review { number, event, body } => provider.review(&http, *number, *event, body).map(|()| Payload::Reviewed),
             }
         })();
-        let _ = tx.send(Reply { repo, request, result });
+        let _ = tx.send(Reply { repo, remote_url, request, result });
         wake();
     });
 }
