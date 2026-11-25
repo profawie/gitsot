@@ -1258,7 +1258,19 @@ impl GitsotApp {
                         }
                         self.refresh();
                     }
-                    self.info(label);
+                    match res.updates.filter(|_| same_repo) {
+                        Some(u) if !u.is_clean() => {
+                            self.dialog = Some(Dialog::Message {
+                                title: "Some branches were not updated".into(),
+                                text: branch_updates_warning(&u),
+                            });
+                        }
+                        Some(u) if !u.updated.is_empty() => {
+                            self.info(format!("Fetched and updated {}", updated_list(&u.updated)));
+                        }
+                        Some(_) => self.info("Fetched from remote. Every branch is up to date."),
+                        None => self.info(label),
+                    }
                 }
                 (op, Err(_)) if res.auth_failed && self.remote_url_for(op).is_some_and(|u| cli::is_http_url(&u)) => {
                     // The remote needs a sign-in. Ask for it ourselves, the same way for
@@ -1517,6 +1529,36 @@ pub(crate) fn relative_time(secs: i64) -> String {
 }
 
 /// `1 commit`, `21 commits`.
+/// `main (2 commits), feature (1 commit)`
+fn updated_list(updated: &[(String, usize)]) -> String {
+    updated.iter().map(|(name, n)| format!("{name} ({})", commits(*n))).collect::<Vec<_>>().join(", ")
+}
+
+/// The text shown after a Fetch that had to leave some branches alone.
+fn branch_updates_warning(u: &cli::BranchUpdates) -> String {
+    let mut parts = Vec::new();
+    if !u.unpushed.is_empty() {
+        let mut text = String::from("These branches have commits that are not pushed yet, so Fetch left them alone:\n");
+        for (name, ahead, behind) in &u.unpushed {
+            text.push_str(&format!("\n  •  {name}: {} not pushed, {} waiting on the remote", commits(*ahead), commits(*behind)));
+        }
+        text.push_str("\n\nSwitch to the branch and use Pull to merge the remote's commits into it, then Push.");
+        parts.push(text);
+    }
+    if !u.failed.is_empty() {
+        let mut text = String::from("These branches could not be updated:\n");
+        for (name, reason) in &u.failed {
+            let reason = cli::friendly_error(reason).replace('\n', "\n      ");
+            text.push_str(&format!("\n  •  {name}: {reason}"));
+        }
+        parts.push(text);
+    }
+    if !u.updated.is_empty() {
+        parts.push(format!("Updated: {}", updated_list(&u.updated)));
+    }
+    parts.join("\n\n")
+}
+
 fn commits(n: usize) -> String {
     if n == 1 { "1 commit".to_string() } else { format!("{n} commits") }
 }
@@ -3363,12 +3405,12 @@ fn remote_buttons(ui: &mut egui::Ui, r: &RepoView, busy: bool, actions: &mut Vec
         let names: Vec<&str> = others.iter().take(4).map(|b| b.name.as_str()).collect();
         let more = if others.len() > names.len() { ", …" } else { "" };
         format!(
-            "Download new commits and branches from the remote\n{} waiting on your other branches: {}{more}",
+            "Download new commits and bring all your branches up to date\n{} waiting on your other branches: {}{more}\nClick to update them. A branch with commits that are not pushed yet is left alone.",
             commits(elsewhere),
             names.join(", ")
         )
     } else {
-        "Download new commits and branches from the remote".to_string()
+        "Download new commits and bring all your branches up to date".to_string()
     };
     if button(ui, "⟳", "Fetch", remote && !busy, false, elsewhere, false).on_hover_text(fetch_hint).clicked() {
         actions.push(Action::Net(NetOp::Fetch));
