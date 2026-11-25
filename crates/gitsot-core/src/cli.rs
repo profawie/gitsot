@@ -57,6 +57,92 @@ pub struct NetResult {
     pub auth_failed: bool,
     /// Credentials from Gitsot's sign-in dialog were used for this attempt.
     pub used_credentials: bool,
+    /// What a successful Fetch did to the local branches.
+    pub updates: Option<BranchUpdates>,
+}
+
+/// What Fetch did to the local branches after downloading from the remotes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BranchUpdates {
+    /// Branches moved forward to their upstream, with the number of new commits.
+    pub updated: Vec<(String, usize)>,
+    /// Branches left alone because they have commits that are not pushed yet
+    /// while the remote has new ones: `(name, unpushed, waiting)`.
+    pub unpushed: Vec<(String, usize, usize)>,
+    /// Branches that could not be moved, with git's reason.
+    pub failed: Vec<(String, String)>,
+}
+
+impl BranchUpdates {
+    pub fn is_clean(&self) -> bool {
+        self.unpushed.is_empty() && self.failed.is_empty()
+    }
+}
+
+/// `[ahead 1, behind 2]` -> `(1, 2)`. `None` when the upstream is gone.
+fn parse_track(track: &str) -> Option<(usize, usize)> {
+    let inner = track.trim().trim_start_matches('[').trim_end_matches(']');
+    if inner == "gone" {
+        return None;
+    }
+    let count = |key: &str| {
+        inner
+            .split(',')
+            .find_map(|part| part.trim().strip_prefix(key))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    Some((count("ahead"), count("behind")))
+}
+
+/// Bring every local branch that follows a remote branch up to date, without
+/// ever touching the network: this only moves branches to commits that the
+/// fetch before it already downloaded.
+///
+/// A branch is moved only when that is a fast-forward, so nothing is merged
+/// and no commit can be lost. A branch with commits that are not pushed yet is
+/// left alone and reported. The current branch is fast-forwarded with
+/// `git merge --ff-only`, which refuses when it would overwrite local changes;
+/// the others with `git fetch . <upstream>:<branch>`, which refuses anything
+/// that is not a fast-forward and any branch checked out in another worktree.
+pub fn update_branches(repo: &Path) -> BranchUpdates {
+    let mut out = BranchUpdates::default();
+    let format = "--format=%(refname)%09%(upstream)%09%(HEAD)%09%(upstream:track)";
+    let Ok(list) = run(Some(repo), &["for-each-ref", format, "refs/heads"], None) else {
+        return out;
+    };
+    for line in list.lines() {
+        let mut cols = line.split('\t');
+        let (Some(refname), Some(upstream), Some(head)) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
+        let Some(name) = refname.strip_prefix("refs/heads/") else { continue };
+        if upstream.is_empty() {
+            continue;
+        }
+        let Some((ahead, behind)) = parse_track(cols.next().unwrap_or("")) else {
+            continue;
+        };
+        if behind == 0 {
+            continue;
+        }
+        if ahead > 0 {
+            out.unpushed.push((name.to_string(), ahead, behind));
+            continue;
+        }
+        let result = if head.trim() == "*" {
+            run(Some(repo), &["merge", "--ff-only", "--quiet", upstream], None)
+        } else {
+            let refspec = format!("{upstream}:{refname}");
+            let args = ["fetch", "--quiet", "--no-tags", "--no-prune", "--no-recurse-submodules", ".", &refspec];
+            run(Some(repo), &args, None)
+        };
+        match result {
+            Ok(_) => out.updated.push((name.to_string(), behind)),
+            Err(e) => out.failed.push((name.to_string(), e)),
+        }
+    }
+    out
 }
 
 /// Username and password (or access token) typed into Gitsot's own sign-in dialog.
@@ -226,9 +312,11 @@ pub fn spawn(
             NetOp::MergeAbort => run(Some(&repo), &["merge", "--abort"], c),
         };
         let auth_failed = matches!(&result, Err(e) if is_auth_error(e));
+        // Fetch also brings the local branches up to date with what it downloaded.
+        let updates = (op == NetOp::Fetch && result.is_ok()).then(|| update_branches(&repo));
         let result = result.map_err(|e| friendly_error(&e));
         let used_credentials = creds.is_some();
-        let _ = tx.send(NetResult { op, repo, result, auth_failed, used_credentials });
+        let _ = tx.send(NetResult { op, repo, result, auth_failed, used_credentials, updates });
         wake();
     });
 }
@@ -393,4 +481,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn track_is_parsed() {
+        assert_eq!(parse_track(""), Some((0, 0)));
+        assert_eq!(parse_track("[ahead 3]"), Some((3, 0)));
+        assert_eq!(parse_track("[behind 12]"), Some((0, 12)));
+        assert_eq!(parse_track("[ahead 1, behind 2]"), Some((1, 2)));
+        assert_eq!(parse_track("[gone]"), None);
+    }
+
+    #[test]
+    fn fetch_updates_every_branch_but_never_one_with_unpushed_commits() {
+        if !git_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("gitsot-fetch-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (origin, work, clone) = (root.join("origin.git"), root.join("work"), root.join("clone"));
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-q", "-b", "main"]);
+        git(&root, &["clone", "-q", "origin.git", "work"]);
+        let commit_in = |dir: &Path, file: &str, text: &str| {
+            std::fs::write(dir.join(file), text).unwrap();
+            git(dir, &["add", file]);
+            git(dir, &["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q", "-m", text]);
+        };
+        let rev = |dir: &Path, name: &str| {
+            let out = Command::new("git").current_dir(dir).args(["rev-parse", name]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&work, &["checkout", "-q", "-b", "main"]);
+        commit_in(&work, "a.txt", "one");
+        git(&work, &["push", "-q", "origin", "main"]);
+        for b in ["feature", "mine", "current", "dirty"] {
+            git(&work, &["branch", b]);
+            git(&work, &["push", "-q", "origin", b]);
+        }
+        git(&root, &["clone", "-q", "origin.git", "clone"]);
+        for b in ["feature", "mine", "current", "dirty"] {
+            git(&clone, &["checkout", "-q", b]);
+        }
+        // "mine" has a commit that is not pushed; "current" is checked out.
+        git(&clone, &["checkout", "-q", "mine"]);
+        commit_in(&clone, "mine.txt", "local work");
+        let mine_before = rev(&clone, "mine");
+        git(&clone, &["checkout", "-q", "current"]);
+        // Somebody else pushes to every branch (two commits to main).
+        for (b, file) in [("main", "a.txt"), ("main", "a.txt"), ("feature", "f.txt"), ("mine", "m.txt"), ("current", "c.txt")] {
+            git(&work, &["checkout", "-q", b]);
+            commit_in(&work, file, &format!("new on {b} {}", rev(&work, "HEAD")));
+            git(&work, &["push", "-q", "origin", b]);
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn(NetOp::Fetch, clone.clone(), None, tx.clone(), || {});
+        let res = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        assert!(res.result.is_ok(), "{:?}", res.result);
+        let updates = res.updates.unwrap();
+        assert_eq!(
+            updates.updated,
+            vec![("current".to_string(), 1), ("feature".to_string(), 1), ("main".to_string(), 2)]
+        );
+        assert_eq!(updates.unpushed, vec![("mine".to_string(), 1, 1)]);
+        assert!(updates.failed.is_empty(), "{:?}", updates.failed);
+        for b in ["main", "feature", "current"] {
+            assert_eq!(rev(&clone, b), rev(&clone, &format!("origin/{b}")), "{b}");
+        }
+        // The checked-out branch got its files too, and "mine" was not touched.
+        assert!(clone.join("c.txt").exists());
+        assert_eq!(rev(&clone, "mine"), mine_before);
+        assert_eq!(rev(&clone, "HEAD"), rev(&clone, "current"));
+
+        // A local change that the new commit would overwrite stops the current
+        // branch from moving, and is reported instead of lost.
+        git(&clone, &["checkout", "-q", "dirty"]);
+        git(&work, &["checkout", "-q", "dirty"]);
+        commit_in(&work, "a.txt", "theirs");
+        git(&work, &["push", "-q", "origin", "dirty"]);
+        std::fs::write(clone.join("a.txt"), "my unsaved work").unwrap();
+        let dirty_before = rev(&clone, "dirty");
+        spawn(NetOp::Fetch, clone.clone(), None, tx, || {});
+        let updates = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap().updates.unwrap();
+        assert_eq!(updates.failed.len(), 1, "{updates:?}");
+        assert_eq!(updates.failed[0].0, "dirty");
+        assert_eq!(rev(&clone, "dirty"), dirty_before);
+        assert_eq!(std::fs::read_to_string(clone.join("a.txt")).unwrap(), "my unsaved work");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
