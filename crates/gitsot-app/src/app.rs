@@ -373,6 +373,8 @@ enum Dialog {
     SignIn { op: NetOp, host: String, username: String, password: String, retry: bool },
     /// About to commit or push with an identity that doesn't match the folder rule.
     IdentityWarning { push: Option<NetOp>, rule: FolderRule, effective: Identity, bad_commits: Vec<(String, String)> },
+    /// Look over what a push would send, and where to, before it is sent.
+    PushReview { op: NetOp, preview: Result<git::PushPreview, String> },
     SetGroup { path: PathBuf, name: String },
     /// Create a group, or rename `rename` when set.
     GroupName { name: String, rename: Option<String> },
@@ -455,6 +457,9 @@ pub(crate) enum Action {
     AdoptRuleAndCommit(Identity),
     CommitIgnoringIdentity,
     PushIgnoringIdentity(NetOp),
+    /// Show what a push would send before sending it. Carries the (remote,
+    /// branch) of a first push, like [`NetOp::Push`].
+    ReviewPush(Option<(String, String)>),
     AskGroup(PathBuf),
     SetGroup(PathBuf, String),
     AskGroupName(Option<String>),
@@ -826,7 +831,18 @@ impl GitsotApp {
             Action::NetWithCredentials(op, creds) => {
                 self.dialog = None;
                 self.last_username = creds.username.clone();
+                // A sign-in only follows a push that was already reviewed, so
+                // don't ask about the identity a second time.
+                self.skip_identity_check = true;
                 self.start_net(ctx, op, Some(creds));
+                self.skip_identity_check = false;
+            }
+            Action::ReviewPush(set_upstream) => {
+                if let Some(r) = &self.repo {
+                    let publish = set_upstream.as_ref().map(|(remote, branch)| (remote.as_str(), branch.as_str()));
+                    let preview = git::push_preview(&r.repo, publish).map_err(|e| format!("{e:#}"));
+                    self.dialog = Some(Dialog::PushReview { op: NetOp::Push { set_upstream }, preview });
+                }
             }
             Action::SetIdentity { name, email, commit_after } => {
                 if name.trim().is_empty() || email.trim().is_empty() {
@@ -2650,7 +2666,11 @@ impl GitsotApp {
         let busy = self.busy.is_some();
 
         let modal = egui::Modal::new(egui::Id::unique("gitsot-dialog")).show(ctx, |ui| {
-            ui.set_width(if matches!(dialog, Dialog::Remotes { .. }) { 620.0 } else { 440.0 });
+            ui.set_width(match dialog {
+                Dialog::Remotes { .. } => 620.0,
+                Dialog::PushReview { .. } => 580.0,
+                _ => 440.0,
+            });
             match dialog {
                 Dialog::Remotes { rows, new_name, new_url, confirm_remove } => {
                     if remotes_dialog(ui, rows, new_name, new_url, confirm_remove, busy, actions) {
@@ -2971,6 +2991,12 @@ impl GitsotApp {
                             close = true;
                         }
                     });
+                }
+                Dialog::PushReview { op, preview } => {
+                    let rule = self.repo.as_ref().and_then(|r| identity::rule_for(&r.rules, &r.path));
+                    if push_review_dialog(ui, op, preview, rule, busy, actions) {
+                        close = true;
+                    }
                 }
                 Dialog::SetGroup { path, name } => {
                     ui.heading("Move to group");
@@ -3440,8 +3466,171 @@ fn remote_buttons(ui: &mut egui::Ui, r: &RepoView, busy: bool, actions: &mut Vec
     };
     if button(ui, "⬆", &push_label, can_push, waiting, r.head.ahead, true).on_hover_text(push_hint).clicked()
     {
-        actions.push(Action::Net(NetOp::Push { set_upstream }));
+        actions.push(Action::ReviewPush(set_upstream));
     }
+}
+
+/// The review shown before a push: where it goes, which commits it sends and
+/// who made them. Commits made with an email other than the folder rule's are
+/// marked, and pushing them takes a second, deliberate click. Returns true
+/// when the dialog should close.
+fn push_review_dialog(
+    ui: &mut egui::Ui,
+    op: &NetOp,
+    preview: &Result<git::PushPreview, String>,
+    rule: Option<&FolderRule>,
+    busy: bool,
+    actions: &mut Vec<Action>,
+) -> bool {
+    let p = theme::pal(ui);
+    let mut close = false;
+    ui.heading("Review before pushing");
+    ui.add_space(4.0);
+    let preview = match preview {
+        Ok(preview) => preview,
+        Err(e) => {
+            ui.label("Gitsot could not work out what this push will send:");
+            ui.label(RichText::new(e).color(theme::ORANGE));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                // The identity check in `start_net` still runs for this push.
+                if theme::primary_enabled(ui, !busy, "Push").clicked() {
+                    actions.push(Action::Net(op.clone()));
+                    close = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+            return close;
+        }
+    };
+    let expected = rule.map(|r| r.identity.email.trim());
+    let wrong = |email: &str| expected.is_some_and(|e| !email.eq_ignore_ascii_case(e));
+    let bad = preview.commits.iter().filter(|c| wrong(&c.email)).count();
+
+    ui.label(RichText::new("Nothing is uploaded until you click Push.").weak());
+    ui.add_space(8.0);
+    egui::Grid::new("push-review-target").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label(RichText::new("Branch").weak());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&preview.local_branch).strong());
+            ui.label(RichText::new("to").weak());
+            ui.label(RichText::new(format!("{}/{}", preview.remote, preview.remote_branch)).strong());
+            if preview.new_branch {
+                ui.label(RichText::new("new branch on the remote").small().color(p.accent_text));
+            }
+        });
+        ui.end_row();
+        ui.label(RichText::new("Remote").weak());
+        ui.add(egui::Label::new(RichText::new(&preview.url).monospace()).truncate()).on_hover_text(&preview.url);
+        ui.end_row();
+        if let Some(rule) = rule {
+            ui.label(RichText::new("Identity").weak());
+            ui.vertical(|ui| {
+                ui.label(RichText::new(rule.identity.display()).strong());
+                ui.label(RichText::new(format!("expected for repositories in {}", rule.folder)).small().weak());
+            });
+            ui.end_row();
+        }
+    });
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    if preview.total == 0 {
+        ui.label(RichText::new("No new commits to push.").strong());
+        ui.label(
+            RichText::new(format!(
+                "Everything on {} is already on {}/{}, as far as the last fetch saw.",
+                preview.local_branch, preview.remote, preview.remote_branch
+            ))
+            .weak(),
+        );
+    } else {
+        ui.label(RichText::new(format!("{} will be pushed", commits(preview.total))).strong());
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            for c in &preview.commits {
+                let is_wrong = wrong(&c.email);
+                theme::card_frame(ui, false).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.spacing_mut().interact_size.y = 0.0;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&c.short_id).monospace().color(p.accent_text));
+                        ui.add(egui::Label::new(RichText::new(&c.summary).strong()).truncate()).on_hover_text(&c.message);
+                    });
+                    ui.horizontal(|ui| {
+                        let who = format!("{} <{}>", c.author, c.email);
+                        if is_wrong {
+                            ui.label(RichText::new(format!("⚠ {who}")).small().strong().color(theme::RED))
+                                .on_hover_text("This is not the identity expected for this repository.");
+                        } else {
+                            ui.label(RichText::new(who).small());
+                        }
+                        ui.label(RichText::new(relative_time(c.time)).small().weak());
+                    });
+                });
+                ui.add_space(2.0);
+            }
+            if preview.total > preview.commits.len() {
+                ui.label(
+                    RichText::new(format!("… and {} more, not listed", preview.total - preview.commits.len())).small().weak(),
+                );
+            }
+        });
+    }
+
+    if bad > 0 {
+        ui.add_space(6.0);
+        let expected = rule.map(|r| r.identity.email.clone()).unwrap_or_default();
+        ui.label(
+            RichText::new(format!(
+                "⚠ {} made with another email than {expected}. Pushing shares {} with everyone on the remote.",
+                if bad == 1 { "1 commit was".to_string() } else { format!("{bad} commits were") },
+                if bad == 1 { "it" } else { "them" },
+            ))
+            .color(theme::RED),
+        );
+    }
+    if preview.behind > 0 {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!(
+                "{}/{} has {} you do not have yet. The remote will refuse this push; use Pull first.",
+                preview.remote,
+                preview.remote_branch,
+                commits(preview.behind)
+            ))
+            .color(theme::ORANGE),
+        );
+    }
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        if bad > 0 {
+            let text = RichText::new("Push anyway").color(theme::RED);
+            if ui.add_enabled(!busy, egui::Button::new(text)).clicked() {
+                actions.push(Action::PushIgnoringIdentity(op.clone()));
+            }
+        } else {
+            let label = match (preview.new_branch, preview.total) {
+                (true, _) => "Publish branch".to_string(),
+                (false, 0) => "Push".to_string(),
+                (false, n) => format!("Push {}", commits(n)),
+            };
+            if theme::primary_enabled(ui, !busy, label).clicked() {
+                actions.push(Action::Net(op.clone()));
+                close = true;
+            }
+        }
+        if ui.button("Cancel").clicked() {
+            close = true;
+        }
+    });
+    close
 }
 
 /// "Last updated on 24/11/2026 09:44:17 PM" with a small button to check
