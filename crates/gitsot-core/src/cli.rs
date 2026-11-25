@@ -20,6 +20,10 @@ pub enum NetOp {
     Merge { branch: String },
     /// Stop a merge that has conflicts (`git merge --abort`).
     MergeAbort,
+    /// Copy one commit onto the current branch (`git cherry-pick <id>`).
+    CherryPick { id: String, summary: String },
+    /// Stop a cherry-pick that has conflicts (`git cherry-pick --abort`).
+    CherryPickAbort,
 }
 
 impl NetOp {
@@ -32,6 +36,8 @@ impl NetOp {
             NetOp::DeleteRemoteBranch { .. } => "delete the branch",
             NetOp::Merge { .. } => "merge",
             NetOp::MergeAbort => "abort the merge",
+            NetOp::CherryPick { .. } => "cherry-pick",
+            NetOp::CherryPickAbort => "abort the cherry-pick",
         }
     }
 
@@ -44,6 +50,8 @@ impl NetOp {
             NetOp::DeleteRemoteBranch { .. } => "Deleting remote branch",
             NetOp::Merge { .. } => "Merging",
             NetOp::MergeAbort => "Aborting the merge",
+            NetOp::CherryPick { .. } => "Cherry-picking",
+            NetOp::CherryPickAbort => "Aborting the cherry-pick",
         }
     }
 }
@@ -310,6 +318,8 @@ pub fn spawn(
             NetOp::DeleteRemoteBranch { remote, branch } => run(Some(&repo), &["push", remote, "--delete", branch], c),
             NetOp::Merge { branch } => run(Some(&repo), &["merge", "--no-edit", branch], c),
             NetOp::MergeAbort => run(Some(&repo), &["merge", "--abort"], c),
+            NetOp::CherryPick { id, .. } => run(Some(&repo), &["cherry-pick", id], c),
+            NetOp::CherryPickAbort => run(Some(&repo), &["cherry-pick", "--abort"], c),
         };
         let auth_failed = matches!(&result, Err(e) if is_auth_error(e));
         // Fetch also brings the local branches up to date with what it downloaded.

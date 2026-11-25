@@ -443,6 +443,8 @@ pub fn signature(repo: &Repository) -> Result<Signature<'static>> {
 pub fn commit(repo: &Repository, message: &str) -> Result<Oid> {
     let sig = signature(repo)?;
     let mut index = repo.index()?;
+    // The git command (merge, cherry-pick) may have changed it on disk.
+    index.read(false)?;
     if index.has_conflicts() {
         bail!("Resolve all conflicts before committing");
     }
@@ -460,6 +462,12 @@ pub fn commit(repo: &Repository, message: &str) -> Result<Oid> {
             parents.push(repo.find_commit(id)?);
         }
     }
+    // Finishing a cherry-pick that had conflicts: the picked commit keeps its
+    // author, and the person finishing it is the committer, like git does.
+    let picked = match repo.state() {
+        git2::RepositoryState::CherryPick => cherry_pick_head(repo).and_then(|id| repo.find_commit(id).ok()),
+        _ => None,
+    };
 
     if !merging {
         if let Some(p) = parents.first() {
@@ -469,12 +477,76 @@ pub fn commit(repo: &Repository, message: &str) -> Result<Oid> {
         }
     }
 
+    let author = match &picked {
+        Some(c) => c.author().to_owned(),
+        None => sig.clone(),
+    };
     let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-    let oid = repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)?;
-    if merging {
+    let oid = repo.commit(Some("HEAD"), &author, &sig, message, &tree, &parent_refs)?;
+    if merging || picked.is_some() {
         repo.cleanup_state()?;
     }
     Ok(oid)
+}
+
+// ---------------------------------------------------------------------------
+// Cherry-pick
+// ---------------------------------------------------------------------------
+
+/// The commit being cherry-picked, while a cherry-pick is stopped on conflicts.
+pub fn cherry_pick_head(repo: &Repository) -> Option<Oid> {
+    let text = std::fs::read_to_string(repo.path().join("CHERRY_PICK_HEAD")).ok()?;
+    Oid::from_str(text.trim()).ok()
+}
+
+/// What cherry-picking a commit onto the current branch would do, worked out
+/// without touching the working folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CherryPickPreview {
+    /// Why the commit cannot be cherry-picked right now, in plain words.
+    pub blocker: Option<String>,
+    /// Files the commit changes that Git cannot apply here by itself.
+    pub conflicts: usize,
+    /// The commit's changes are already here, so it would add nothing.
+    pub empty: bool,
+}
+
+/// Preview copying commit `id` onto the current branch.
+///
+/// A cherry-pick is refused while there are uncommitted changes to tracked
+/// files: a conflict would mix them with the picked changes, and aborting
+/// could then lose them.
+pub fn cherry_pick_preview(repo: &Repository, id: Oid) -> Result<CherryPickPreview> {
+    let blocked = |why: String| Ok(CherryPickPreview { blocker: Some(why), ..Default::default() });
+    let commit = repo.find_commit(id)?;
+    if let Some(state) = head_info(repo).state {
+        return blocked(format!("{state}. Finish or abort it first."));
+    }
+    let Some(head) = repo.head().ok().and_then(|h| h.peel_to_commit().ok()) else {
+        return blocked("The current branch has no commits yet.".into());
+    };
+    if commit.parent_count() > 1 {
+        return blocked("This is a merge commit. Cherry-pick the commits it brought in instead.".into());
+    }
+    if on_head(repo, id) {
+        return blocked("This commit is already part of the current branch.".into());
+    }
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(false).include_ignored(false).exclude_submodules(true);
+    let dirty = repo.statuses(Some(&mut opts))?.len();
+    if dirty > 0 {
+        let files = if dirty == 1 { "1 file has".to_string() } else { format!("{dirty} files have") };
+        return blocked(format!("{files} uncommitted changes. Commit or discard them first, then cherry-pick."));
+    }
+    let mut index = repo.cherrypick_commit(&commit, &head, 0, None)?;
+    let mut paths = std::collections::BTreeSet::new();
+    for c in index.conflicts()?.flatten() {
+        if let Some(entry) = c.our.or(c.their).or(c.ancestor) {
+            paths.insert(entry.path);
+        }
+    }
+    let empty = paths.is_empty() && index.write_tree_to(repo)? == head.tree_id();
+    Ok(CherryPickPreview { blocker: None, conflicts: paths.len(), empty })
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +686,30 @@ pub fn history(repo: &Repository, limit: usize, all_refs: bool) -> Result<Vec<Co
         out.push(commit_info(&repo.find_commit(oid)?));
     }
     Ok(out)
+}
+
+/// The commits of one branch: a local branch, or a remote one such as
+/// `origin/main`. Used by the List view to show another branch than the
+/// current one, so its commits can be cherry-picked.
+pub fn branch_history(repo: &Repository, limit: usize, branch: &str) -> Result<Vec<CommitInfo>> {
+    let tip = repo
+        .find_reference(&format!("refs/heads/{branch}"))
+        .or_else(|_| repo.find_reference(&format!("refs/remotes/{branch}")))?
+        .peel_to_commit()?;
+    let mut walk = repo.revwalk()?;
+    walk.push(tip.id())?;
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
+    let mut out = Vec::new();
+    for oid in walk.take(limit) {
+        out.push(commit_info(&repo.find_commit(oid?)?));
+    }
+    Ok(out)
+}
+
+/// The commit is already part of the current branch (it is HEAD or behind it).
+pub fn on_head(repo: &Repository, id: Oid) -> bool {
+    let Some(head) = repo.head().ok().and_then(|h| h.target()) else { return false };
+    head == id || repo.graph_descendant_of(head, id).unwrap_or(false)
 }
 
 fn commit_info(c: &git2::Commit) -> CommitInfo {
@@ -1157,6 +1253,68 @@ mod tests {
         std::fs::write(dir.join(file), text).unwrap();
         stage(repo, &[file.into()]).unwrap();
         commit(repo, message).unwrap()
+    }
+
+    #[test]
+    fn cherry_pick_preview_blocks_and_counts_conflicts() {
+        let (dir, repo) = tmp_repo();
+        let first = write_commit(&dir, &repo, "a.txt", "one\n", "First");
+        let main = head_info(&repo).branch.unwrap();
+
+        create_branch(&repo, "feature", true).unwrap();
+        let clean = write_commit(&dir, &repo, "b.txt", "b\n", "Add b");
+        let clash = write_commit(&dir, &repo, "a.txt", "feature\n", "Change a");
+        checkout_branch(&repo, &main).unwrap();
+        write_commit(&dir, &repo, "a.txt", "main\n", "Main change");
+
+        assert_eq!(cherry_pick_preview(&repo, clean).unwrap(), CherryPickPreview::default());
+        assert_eq!(cherry_pick_preview(&repo, clash).unwrap().conflicts, 1);
+        // Already on this branch.
+        assert!(cherry_pick_preview(&repo, first).unwrap().blocker.is_some());
+        assert!(on_head(&repo, first) && !on_head(&repo, clean));
+        let ids: Vec<Oid> = branch_history(&repo, 10, "feature").unwrap().iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![clash, clean, first]);
+        // Nothing was touched by previewing.
+        assert!(status(&repo).unwrap().is_empty());
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+
+        // Untracked files are fine, changes to tracked files are not.
+        std::fs::write(dir.join("new.txt"), "x\n").unwrap();
+        assert!(cherry_pick_preview(&repo, clean).unwrap().blocker.is_none());
+        std::fs::write(dir.join("a.txt"), "edited\n").unwrap();
+        let blocker = cherry_pick_preview(&repo, clean).unwrap().blocker.unwrap();
+        assert!(blocker.contains("uncommitted"), "{blocker}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_finishes_a_cherry_pick_with_the_original_author() {
+        let (dir, repo) = tmp_repo();
+        write_commit(&dir, &repo, "a.txt", "one\n", "First");
+        let main = head_info(&repo).branch.unwrap();
+        create_branch(&repo, "feature", true).unwrap();
+        repo.config().unwrap().set_str("user.email", "other@example.com").unwrap();
+        let picked = write_commit(&dir, &repo, "a.txt", "feature\n", "Change a");
+        repo.config().unwrap().set_str("user.email", "test@example.com").unwrap();
+        checkout_branch(&repo, &main).unwrap();
+        write_commit(&dir, &repo, "a.txt", "main\n", "Main change");
+
+        // Start the cherry-pick the way git does: it stops on the conflict.
+        repo.cherrypick(&repo.find_commit(picked).unwrap(), None).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::CherryPick);
+        assert_eq!(cherry_pick_head(&repo), Some(picked));
+        assert!(commit(&repo, "Change a").is_err(), "conflicts must be resolved first");
+
+        std::fs::write(dir.join("a.txt"), "both\n").unwrap();
+        stage(&repo, &["a.txt".into()]).unwrap();
+        let done = repo.find_commit(commit(&repo, "Change a").unwrap()).unwrap();
+        assert_eq!(done.author().email().ok(), Some("other@example.com"));
+        assert_eq!(done.committer().email().ok(), Some("test@example.com"));
+        assert_eq!(done.parent_count(), 1);
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

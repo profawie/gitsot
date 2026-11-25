@@ -117,6 +117,8 @@ struct RepoView {
     history_loaded: bool,
     /// History includes every branch (tree view) rather than just HEAD.
     history_all: bool,
+    /// The branch the List view shows, when it is not the current one.
+    list_branch: Option<String>,
     graph: Graph,
     labels: HashMap<Oid, Vec<RefLabel>>,
     selected_commit: Option<Oid>,
@@ -156,6 +158,7 @@ impl RepoView {
             history: Vec::new(),
             history_loaded: false,
             history_all: false,
+            list_branch: None,
             graph: Graph::default(),
             labels: HashMap::new(),
             selected_commit: None,
@@ -199,7 +202,18 @@ impl RepoView {
     }
 
     fn load_history(&mut self, all_refs: bool) {
-        self.history = git::history(&self.repo, git::MAX_HISTORY, all_refs).unwrap_or_default();
+        // A branch picked for the List view that is gone, or is now the current one.
+        let head = self.head.branch.clone();
+        if self.list_branch.as_ref().is_some_and(|b| Some(b) == head.as_ref()) {
+            self.list_branch = None;
+        }
+        self.history = match self.list_branch.as_deref().filter(|_| !all_refs) {
+            Some(b) => git::branch_history(&self.repo, git::MAX_HISTORY, b).unwrap_or_else(|_| {
+                self.list_branch = None;
+                git::history(&self.repo, git::MAX_HISTORY, false).unwrap_or_default()
+            }),
+            None => git::history(&self.repo, git::MAX_HISTORY, all_refs).unwrap_or_default(),
+        };
         self.history_loaded = true;
         self.history_all = all_refs;
         self.labels = git::ref_labels(&self.repo);
@@ -375,6 +389,8 @@ enum Dialog {
     IdentityWarning { push: Option<NetOp>, rule: FolderRule, effective: Identity, bad_commits: Vec<(String, String)> },
     /// Look over what a push would send, and where to, before it is sent.
     PushReview { op: NetOp, preview: Result<git::PushPreview, String> },
+    /// Confirm copying one commit from History onto the current branch.
+    CherryPick { commit: git::CommitInfo, preview: Result<git::CherryPickPreview, String> },
     SetGroup { path: PathBuf, name: String },
     /// Create a group, or rename `rename` when set.
     GroupName { name: String, rename: Option<String> },
@@ -429,6 +445,11 @@ pub(crate) enum Action {
     AskDeleteBranch(String),
     AskDeleteRemoteBranch(String),
     ShowMerge(Option<String>),
+    /// Ask before copying a commit from History onto the current branch.
+    AskCherryPick(Oid),
+    /// Copy the commit onto the current branch. `adopt` first makes the folder
+    /// rule's identity the one this repository commits with.
+    CherryPick { id: Oid, adopt: Option<Identity> },
     DeleteBranch(String),
     ShowRemotes,
     /// Change the URL (and the separate push URL, when there is one) of a remote.
@@ -448,6 +469,8 @@ pub(crate) enum Action {
     SetLightMode(bool),
     ForgetRecent(PathBuf),
     SetHistoryTree(bool),
+    /// Show another branch in the List view (`None`: the current branch).
+    SetListBranch(Option<String>),
     SetLocalIdentity(Identity),
     EditRepoIdentity,
     ClearLocalIdentity,
@@ -817,6 +840,12 @@ impl GitsotApp {
                     r.load_history(tree);
                 }
             }
+            Action::SetListBranch(branch) => {
+                if let Some(r) = &mut self.repo {
+                    r.list_branch = branch;
+                    r.load_history(false);
+                }
+            }
             Action::CopyToClipboard(text) => {
                 ctx.copy_text(text);
                 self.info("Copied to clipboard");
@@ -915,6 +944,19 @@ impl GitsotApp {
                 self.skip_identity_check = true;
                 self.apply(ctx, Action::Commit);
                 self.skip_identity_check = false;
+            }
+            Action::CherryPick { id, adopt } => {
+                self.dialog = None;
+                let Some(r) = self.repo.as_mut() else { return };
+                if let Some(identity) = adopt {
+                    if let Err(e) = identity::set_local(&r.repo, &identity) {
+                        self.error(format!("{e:#}"));
+                        return;
+                    }
+                    r.id_status = identity::status(&r.repo, &r.path, &r.rules);
+                }
+                let summary = r.history.iter().find(|c| c.id == id).map(|c| c.summary.clone()).unwrap_or_default();
+                self.start_net(ctx, NetOp::CherryPick { id: id.to_string(), summary }, None);
             }
             Action::PushIgnoringIdentity(op) => {
                 self.dialog = None;
@@ -1026,7 +1068,8 @@ impl GitsotApp {
                             r.summary.clear();
                             r.description.clear();
                             r.refresh()?;
-                            if r.history_loaded {
+                            // The List view may be showing another branch.
+                            if r.history_loaded && r.history.iter().any(|c| c.id == oid) {
                                 r.select_commit(Some(oid));
                             }
                             return Ok(Some(format!(
@@ -1047,6 +1090,16 @@ impl GitsotApp {
                         }
                         Action::ShowMerge(selected) => {
                             self.dialog = Some(Dialog::Merge { filter: String::new(), selected, preview: None });
+                            return Ok(None);
+                        }
+                        Action::AskCherryPick(id) => {
+                            let Some(commit) = r.history.iter().find(|c| c.id == id).cloned() else {
+                                return Ok(None);
+                            };
+                            r.refresh()?;
+                            r.id_status = identity::status(&r.repo, &r.path, &r.rules);
+                            let preview = git::cherry_pick_preview(&r.repo, id).map_err(|e| format!("{e:#}"));
+                            self.dialog = Some(Dialog::CherryPick { commit, preview });
                             return Ok(None);
                         }
                         Action::ShowNewBranch => {
@@ -1255,6 +1308,19 @@ impl GitsotApp {
                     let head = self.repo.as_ref().map(|r| r.head.display_name()).unwrap_or_default();
                     self.info(format!("Merged {branch} into {head}"));
                 }
+                (NetOp::CherryPick { id, .. }, Ok(_)) => {
+                    let short: String = id.chars().take(7).collect();
+                    self.refresh();
+                    if let Some(r) = self.repo.as_mut() {
+                        // Select the new commit, unless the List view shows another branch.
+                        let head = r.repo.head().ok().and_then(|h| h.target());
+                        if r.history_loaded && r.history.iter().any(|c| Some(c.id) == head) {
+                            r.select_commit(head);
+                        }
+                    }
+                    let head = self.repo.as_ref().map(|r| r.head.display_name()).unwrap_or_default();
+                    self.info(format!("Cherry-picked {short} onto {head}"));
+                }
                 (op, Ok(_)) => {
                     let label = match op {
                         NetOp::Fetch => "Fetched from remote",
@@ -1263,6 +1329,8 @@ impl GitsotApp {
                         NetOp::DeleteRemoteBranch { .. } => "Deleted the remote branch",
                         NetOp::Merge { .. } => unreachable!(),
                         NetOp::MergeAbort => "Merge aborted. Your branch is back to how it was.",
+                        NetOp::CherryPick { .. } => unreachable!(),
+                        NetOp::CherryPickAbort => "Cherry-pick aborted. Your branch is back to how it was.",
                         NetOp::Clone { .. } => unreachable!(),
                     };
                     let fetched = matches!(op, NetOp::Fetch | NetOp::Pull);
@@ -1312,6 +1380,53 @@ impl GitsotApp {
                              They are marked ! in Changes. Open each one in your editor, choose what to keep \
                              (remove the <<<<<<< ======= >>>>>>> lines), tick it, then commit to finish the merge.\n\n\
                              To give up instead, use Abort merge at the top of Changes.\n\n{e}"
+                        ),
+                    });
+                }
+                (NetOp::CherryPick { id, summary }, Err(e))
+                    if self.repo.as_ref().is_some_and(|r| r.repo.state() == git2::RepositoryState::CherryPick) =>
+                {
+                    let short: String = id.chars().take(7).collect();
+                    let picked = Oid::from_str(id).ok();
+                    // git stops on an empty pick too ("The previous cherry-pick is now
+                    // empty"). The cached index must be read again to see conflicts.
+                    let has_conflicts = self.repo.as_ref().and_then(|r| r.repo.index().ok()).is_some_and(|mut i| {
+                        let _ = i.read(true);
+                        i.has_conflicts()
+                    });
+                    let empty = e.contains("is now empty") || e.contains("nothing to commit");
+                    if empty && !has_conflicts {
+                        // Git stopped because the commit adds nothing here. Nothing
+                        // was changed, so just leave the cherry-pick.
+                        if let Some(r) = &self.repo {
+                            let _ = r.repo.cleanup_state();
+                        }
+                        self.refresh();
+                        self.dialog = Some(Dialog::Message {
+                            title: "Nothing to cherry-pick".into(),
+                            text: format!("The changes of {short} ({summary}) are already on this branch, so no commit was made."),
+                        });
+                        continue;
+                    }
+                    self.refresh();
+                    self.active = HOME;
+                    // The commit box starts with the picked commit's message.
+                    if let Some(r) = self.repo.as_mut() {
+                        let message = picked.and_then(|p| r.repo.find_commit(p).ok()).and_then(|c| c.message().ok().map(str::to_string));
+                        if let (Some(message), true) = (message, r.summary.trim().is_empty() && r.description.trim().is_empty()) {
+                            let (first, rest) = message.split_once('\n').unwrap_or((&message, ""));
+                            r.summary = first.trim().to_string();
+                            r.description = rest.trim().to_string();
+                        }
+                    }
+                    self.dialog = Some(Dialog::Message {
+                        title: "The cherry-pick has conflicts".into(),
+                        text: format!(
+                            "Some files changed by {short} ({summary}) were also changed on this branch, so it could not be applied automatically.\n\n\
+                             They are marked ! in Changes. Open each one in your editor, choose what to keep \
+                             (remove the <<<<<<< ======= >>>>>>> lines), tick it, then commit to finish the cherry-pick. \
+                             The commit keeps its original author.\n\n\
+                             To give up instead, use Abort cherry-pick at the top of Changes.\n\n{e}"
                         ),
                     });
                 }
@@ -1435,7 +1550,11 @@ fn workspace(ui: &mut egui::Ui, r: &mut RepoView, history_tree: bool, open_diffs
     egui::CentralPanel::default().frame(column(8, 8)).show(ui, |ui| {
         // The heading, with the List / Tree switch on its right.
         ui.horizontal(|ui| {
-            theme::column_header(ui, &format!("History · {}", if history_tree { "all branches".to_string() } else { r.head.display_name() }));
+            if history_tree {
+                theme::column_header(ui, "History · all branches");
+            } else {
+                list_branch_picker(ui, r, actions);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| segmented(ui, history_tree, actions));
         });
         ui.add_space(4.0);
@@ -2030,6 +2149,11 @@ impl GitsotApp {
                             && button(ui, "↩", "Abort merge", !busy, true).on_hover_text("Undo the merge and go back to how your branch was").clicked()
                         {
                             actions.push(Action::Net(NetOp::MergeAbort));
+                        }
+                        if r.repo.state() == git2::RepositoryState::CherryPick
+                            && button(ui, "↩", "Abort cherry-pick", !busy, true).on_hover_text("Undo the cherry-pick and go back to how your branch was").clicked()
+                        {
+                            actions.push(Action::Net(NetOp::CherryPickAbort));
                         }
                         ui.separator();
                         if button(ui, ">_", "Terminal", true, false)
@@ -2669,6 +2793,7 @@ impl GitsotApp {
             ui.set_width(match dialog {
                 Dialog::Remotes { .. } => 620.0,
                 Dialog::PushReview { .. } => 580.0,
+                Dialog::CherryPick { .. } => 520.0,
                 _ => 440.0,
             });
             match dialog {
@@ -2991,6 +3116,15 @@ impl GitsotApp {
                             close = true;
                         }
                     });
+                }
+                Dialog::CherryPick { commit, preview } => {
+                    let Some(r) = self.repo.as_ref() else {
+                        close = true;
+                        return;
+                    };
+                    if cherry_pick_dialog(ui, commit, preview, &r.head.display_name(), &r.id_status, busy, actions) {
+                        close = true;
+                    }
                 }
                 Dialog::PushReview { op, preview } => {
                     let rule = self.repo.as_ref().and_then(|r| identity::rule_for(&r.rules, &r.path));
@@ -3474,6 +3608,122 @@ fn remote_buttons(ui: &mut egui::Ui, r: &RepoView, busy: bool, actions: &mut Vec
 /// who made them. Commits made with an email other than the folder rule's are
 /// marked, and pushing them takes a second, deliberate click. Returns true
 /// when the dialog should close.
+/// Confirm a cherry-pick: which commit, onto which branch, who the new commit
+/// is made as, and anything that stands in the way. Returns true to close.
+fn cherry_pick_dialog(
+    ui: &mut egui::Ui,
+    commit: &git::CommitInfo,
+    preview: &Result<git::CherryPickPreview, String>,
+    branch: &str,
+    id_status: &identity::Status,
+    busy: bool,
+    actions: &mut Vec<Action>,
+) -> bool {
+    let p = theme::pal(ui);
+    let mut close = false;
+    ui.heading(format!("Cherry-pick onto {branch}"));
+    ui.add_space(4.0);
+    ui.label(RichText::new("Copies the changes of this one commit onto your current branch, as a new commit.").weak());
+    ui.add_space(8.0);
+    theme::card_frame(ui, false).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&commit.short_id).monospace().color(p.accent_text));
+            ui.add(egui::Label::new(RichText::new(&commit.summary).strong()).truncate()).on_hover_text(&commit.message);
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{} <{}>", commit.author, commit.email)).small());
+            ui.label(RichText::new(relative_time(commit.time)).small().weak());
+        });
+    });
+    ui.add_space(8.0);
+
+    let me = &id_status.effective;
+    let mismatch = id_status.mismatch();
+    egui::Grid::new("cherry-pick-who").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label(RichText::new("Author").weak());
+        ui.vertical(|ui| {
+            ui.label(format!("{} <{}>", commit.author, commit.email));
+            ui.label(RichText::new("stays the same as on the original commit").small().weak());
+        });
+        ui.end_row();
+        ui.label(RichText::new("Committer").weak());
+        ui.vertical(|ui| {
+            if !me.is_set() {
+                ui.label(RichText::new("Not set").strong().color(theme::RED));
+            } else if mismatch.is_some() {
+                ui.label(RichText::new(format!("⚠ {}", me.display())).strong().color(theme::RED));
+            } else {
+                ui.label(RichText::new(me.display()).strong());
+            }
+            ui.label(RichText::new("you, recorded on the new commit").small().weak());
+        });
+        ui.end_row();
+    });
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    let blocker = match preview {
+        Err(e) => Some(e.clone()),
+        Ok(pv) => pv.blocker.clone(),
+    }
+    .or_else(|| (!me.is_set()).then(|| "Your Git name and email are not set. Set them with Change above the commit box first.".to_string()))
+    .or_else(|| preview.as_ref().ok().filter(|pv| pv.empty).map(|_| "Its changes are already on this branch, so there is nothing to copy.".to_string()));
+
+    if let Some(why) = &blocker {
+        ui.label(RichText::new("⚠ This commit cannot be cherry-picked right now").strong().color(theme::ORANGE));
+        ui.add(egui::Label::new(why.as_str()).wrap());
+    } else if let Ok(pv) = preview {
+        if pv.conflicts > 0 {
+            let files = if pv.conflicts == 1 { "1 file".to_string() } else { format!("{} files", pv.conflicts) };
+            ui.label(RichText::new(format!("⚠ There will be conflicts in {files}")).strong().color(theme::ORANGE));
+            ui.label(RichText::new("You fix them in Changes after the cherry-pick starts, or abort it.").small().weak());
+        } else {
+            ui.label(RichText::new("✔ This commit applies cleanly").color(Color32::from_rgb(63, 185, 80)));
+        }
+    }
+    if let (Some(rule), None) = (mismatch, &blocker) {
+        ui.add_space(6.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "⚠ This repository is inside {}, which uses {}. The new commit would be made as {} instead.",
+                    rule.folder,
+                    rule.identity.display(),
+                    me.display()
+                ))
+                .color(theme::RED),
+            )
+            .wrap(),
+        );
+    }
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        let ready = blocker.is_none() && !busy;
+        match mismatch.filter(|_| blocker.is_none()) {
+            Some(rule) => {
+                if theme::primary_enabled(ui, ready, format!("Use {} and cherry-pick", rule.identity.email)).clicked() {
+                    actions.push(Action::CherryPick { id: commit.id, adopt: Some(rule.identity.clone()) });
+                }
+                if ui.add_enabled(ready, egui::Button::new(RichText::new("Cherry-pick anyway").color(theme::RED))).clicked() {
+                    actions.push(Action::CherryPick { id: commit.id, adopt: None });
+                }
+            }
+            None => {
+                if theme::primary_enabled(ui, ready, "Cherry-pick").clicked() {
+                    actions.push(Action::CherryPick { id: commit.id, adopt: None });
+                }
+            }
+        }
+        if ui.button("Cancel").clicked() {
+            close = true;
+        }
+    });
+    close
+}
+
 fn push_review_dialog(
     ui: &mut egui::Ui,
     op: &NetOp,
@@ -3857,16 +4107,28 @@ fn branch_menu(ui: &mut egui::Ui, r: &mut RepoView, actions: &mut Vec<Action>) {
 
 /// First column: changed files to tick, and the commit box under them.
 fn changes_column(ui: &mut egui::Ui, r: &mut RepoView, open_diffs: &[String], actions: &mut Vec<Action>) {
-    if r.repo.state() == git2::RepositoryState::Merge {
+    let banner = match r.repo.state() {
+        git2::RepositoryState::Merge => {
+            Some(("Abort merge", "Undo the merge and go back to how your branch was", "Merging: fix the ! files, tick them, then commit", NetOp::MergeAbort))
+        }
+        git2::RepositoryState::CherryPick => Some((
+            "Abort cherry-pick",
+            "Undo the cherry-pick and go back to how your branch was",
+            "Cherry-picking: fix the ! files, tick them, then commit",
+            NetOp::CherryPickAbort,
+        )),
+        _ => None,
+    };
+    if let Some((label, hover, text, abort)) = banner {
         egui::Panel::top("merge_banner").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("Abort merge").on_hover_text("Undo the merge and go back to how your branch was").clicked() {
-                        actions.push(Action::Net(NetOp::MergeAbort));
+                    if ui.small_button(label).on_hover_text(hover).clicked() {
+                        actions.push(Action::Net(abort));
                     }
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new("Merging: fix the ! files, tick them, then commit").color(theme::ORANGE)).wrap());
+                        ui.add(egui::Label::new(RichText::new(text).color(theme::ORANGE)).wrap());
                     });
                 });
             });
@@ -3999,6 +4261,43 @@ fn changes_column(ui: &mut egui::Ui, r: &mut RepoView, open_diffs: &[String], ac
     });
 }
 
+/// The List view's heading: the branch it shows, with a menu to show another
+/// one (to cherry-pick from it without switching branches).
+fn list_branch_picker(ui: &mut egui::Ui, r: &RepoView, actions: &mut Vec<Action>) {
+    let current = r.head.display_name();
+    let shown = r.list_branch.clone().unwrap_or_else(|| current.clone());
+    theme::column_header(ui, "History ·");
+    let other = r.list_branch.is_some();
+    let text = RichText::new(format!("{} ⏷", shorten(&shown, 32))).small().strong();
+    let btn = ui
+        .add(egui::Button::new(if other { text.color(theme::ORANGE) } else { text }).small())
+        .on_hover_text("Show the commits of another branch, to cherry-pick from it");
+    egui::Popup::menu(&btn).show(|ui| {
+        ui.set_min_width(220.0);
+        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+            if ui.add(egui::Button::selectable(!other, format!("{current} (current)"))).clicked() {
+                actions.push(Action::SetListBranch(None));
+                ui.close();
+            }
+            let local = r.branches.iter().filter(|b| !b.is_head).map(|b| b.name.clone());
+            let names: Vec<String> = local.chain(r.remote_branches.iter().cloned()).collect();
+            if !names.is_empty() {
+                ui.separator();
+            }
+            for n in names {
+                let sel = r.list_branch.as_deref() == Some(n.as_str());
+                if ui.add(egui::Button::selectable(sel, n.as_str())).clicked() {
+                    actions.push(Action::SetListBranch(Some(n)));
+                    ui.close();
+                }
+            }
+        });
+    });
+    if other && ui.small_button("Back to current").on_hover_text(format!("Show {current} again")).clicked() {
+        actions.push(Action::SetListBranch(None));
+    }
+}
+
 /// Second column: the commits, as a branch tree or a plain list.
 fn history_column(ui: &mut egui::Ui, r: &mut RepoView, tree: bool, actions: &mut Vec<Action>) {
     if r.history.is_empty() {
@@ -4077,6 +4376,23 @@ fn history_column(ui: &mut egui::Ui, r: &mut RepoView, tree: bool, actions: &mut
                 actions.push(Action::SelectCommit(c.id));
             }
             resp.context_menu(|ui| {
+                let onto = shorten(&r.head.display_name(), 30);
+                let here = git::on_head(&r.repo, c.id);
+                let hint = if here {
+                    format!("This commit is already on {onto}. Cherry-pick a commit from another branch.")
+                } else {
+                    "Copy this commit's changes onto your current branch as a new commit".to_string()
+                };
+                if ui
+                    .add_enabled(!here, egui::Button::new(format!("🍒  Cherry-pick onto {onto}…")))
+                    .on_hover_text(hint.clone())
+                    .on_disabled_hover_text(hint)
+                    .clicked()
+                {
+                    actions.push(Action::AskCherryPick(c.id));
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("Copy commit id").clicked() {
                     actions.push(Action::CopyToClipboard(c.id.to_string()));
                     ui.close();

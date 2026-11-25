@@ -4,7 +4,7 @@ members = ["crates/gitsot-core", "crates/gitsot-app", "crates/gitsot"]
 default-members = ["crates/gitsot-core", "crates/gitsot-app", "crates/gitsot"]
 
 [workspace.package]
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 publish = false
 
