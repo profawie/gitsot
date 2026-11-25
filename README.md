@@ -17,6 +17,7 @@ Runs on **Windows** and **macOS** (Linux works too). Built with [egui/eframe](ht
 - **Remote**: Fetch, Pull and Push, each with a **badge counting the commits that are waiting**. Gitsot checks the remote every 3 minutes and shows *Last updated on …* at the bottom. New branches get a *Publish branch* button. See [Staying up to date](#staying-up-to-date) below.
 - **Remotes**: *Remotes* in the ribbon shows where the repository is fetched from and pushed to. **Change a remote's URL** (for example after the project moved to another host or you switch between HTTPS and SSH), add another remote or remove one. See [Remotes](#remotes) below.
 - **History**: switch between a **Tree** view (the default) (coloured branch graph with branch, remote and tag labels) and a simple **List**. Rest the pointer on a commit to see its **commit date and time**. The third column shows the selected commit, its files and a diff; double-click a file to open it in a tab.
+- **Cherry-pick**: right-click a commit in History (Tree or List) and choose *Cherry-pick onto <your branch>* to copy that one commit onto the branch you are on. Gitsot first shows the commit, its author (kept as it was) and who the new commit is made as, and warns when that is not the identity your folder rule expects. It refuses while you have uncommitted changes, for merge commits, and for commits already on your branch. If the commit conflicts, the files are marked `!` in Changes with the commit message ready in the commit box; fix them and commit, or *Abort cherry-pick*.
 - **Terminal**: *Terminal* in the ribbon starts a shell in the repository folder, in a new tab. Click it again for **another session in another tab**. See [Terminal](#terminal) below.
 - **Pull requests**: list them, read the description, files and reviews, then **approve**, **request changes** (reject) or **comment**, each pull request in its own tab. See [Pull requests](#pull-requests) below.
 - **Repositories**: your repositories as cards showing the branch, host and the **name/email that commits will use**. Organise them into **groups**: click *New group*, then drag cards onto a group: the card lifts off the page and follows the pointer, and a line under it says what dropping there does (or use the card menu ☰ → *Move to group…*). Rename or delete a group with the pencil and bin icons next to its name, and click its name to fold it. Open a local folder, clone from a URL, or create a new one.
@@ -85,6 +86,23 @@ Click **Merge**, pick a branch, and Gitsot works out the result before anything 
 - If the local branch you picked is behind its remote (for example `main` is behind `origin/main`), Gitsot says so and suggests the remote branch.
 
 When your branch has no commits of its own it simply moves forward (a fast-forward), and Git does not add an extra merge commit.
+
+### Cherry-picking
+
+![The Cherry-pick dialog shows the commit, its author and who the new commit is made as](docs/cherry-pick.png)
+
+Right-click a commit in **History** and choose **Cherry-pick onto *your branch*** to copy that one commit onto the branch you are on. It works in both views:
+
+- **Tree** shows every branch, so right-click any commit that is not on your branch yet.
+- **List** shows one branch. Click the branch name at the top of the list to show another branch's commits (without switching to it), then right-click one. *Back to current* returns to your branch.
+
+Before anything changes, Gitsot shows the commit, says whether it applies cleanly or how many files will conflict, and who the new commit is made as:
+
+- The **author** stays the person who wrote the original commit. **You** are recorded as the committer.
+- If the repository is covered by a folder rule and your identity does not match it, the committer is shown in red, with *Use <rule email> and cherry-pick* and *Cherry-pick anyway*.
+- It is refused while you have **uncommitted changes** to tracked files (commit or discard them first), during another merge, rebase or cherry-pick, for **merge commits**, and for commits that are already on your branch.
+
+If the cherry-pick has conflicts, the files are marked `!` in Changes and the commit box is filled with the original commit message. Fix the files, tick them and commit to finish (the original author is kept), or use **Abort cherry-pick** to go back to how your branch was.
 
 ## Remotes
 
