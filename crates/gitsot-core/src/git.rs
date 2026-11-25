@@ -611,20 +611,23 @@ pub fn history(repo: &Repository, limit: usize, all_refs: bool) -> Result<Vec<Co
     let mut out = Vec::new();
     for oid in walk.take(limit) {
         let oid = oid?;
-        let c = repo.find_commit(oid)?;
-        let author = c.author();
-        out.push(CommitInfo {
-            id: oid,
-            short_id: short(oid),
-            summary: c.summary().ok().flatten().unwrap_or("").to_string(),
-            message: c.message().unwrap_or("").trim_end().to_string(),
-            author: author.name().unwrap_or("Unknown").to_string(),
-            email: author.email().unwrap_or("").to_string(),
-            time: c.time().seconds(),
-            parents: c.parent_ids().collect(),
-        });
+        out.push(commit_info(&repo.find_commit(oid)?));
     }
     Ok(out)
+}
+
+fn commit_info(c: &git2::Commit) -> CommitInfo {
+    let author = c.author();
+    CommitInfo {
+        id: c.id(),
+        short_id: short(c.id()),
+        summary: c.summary().ok().flatten().unwrap_or("").to_string(),
+        message: c.message().unwrap_or("").trim_end().to_string(),
+        author: author.name().unwrap_or("Unknown").to_string(),
+        email: author.email().unwrap_or("").to_string(),
+        time: c.time().seconds(),
+        parents: c.parent_ids().collect(),
+    }
 }
 
 /// Every branch, remote branch and tag, grouped by the commit it points at.
@@ -817,6 +820,84 @@ pub fn merge_preview(repo: &Repository, branch: &str) -> Result<MergePreview> {
         preview.conflicts = paths.len();
     }
     Ok(preview)
+}
+
+/// What a push of the current branch would send, and where to, worked out
+/// from what the last fetch saw. Shown for review before anything is uploaded.
+#[derive(Clone, Debug)]
+pub struct PushPreview {
+    pub local_branch: String,
+    pub remote: String,
+    /// Name of the branch on the remote.
+    pub remote_branch: String,
+    /// Address the push goes to (the push URL when the remote has one).
+    pub url: String,
+    /// The branch does not exist on the remote yet.
+    pub new_branch: bool,
+    /// Commits the push would add to the remote, newest first (at most [`PUSH_PREVIEW_LIMIT`]).
+    pub commits: Vec<CommitInfo>,
+    /// How many commits the push would add; more than `commits.len()` when the list was cut.
+    pub total: usize,
+    /// Commits the remote branch has that this branch does not. The remote
+    /// refuses the push while this is not zero.
+    pub behind: usize,
+}
+
+pub const PUSH_PREVIEW_LIMIT: usize = 200;
+
+/// Preview pushing the current branch. `publish` is the (remote, branch) of a
+/// first push (`git push -u <remote> <branch>`); `None` previews a plain
+/// `git push` to the branch's upstream.
+pub fn push_preview(repo: &Repository, publish: Option<(&str, &str)>) -> Result<PushPreview> {
+    let head = repo.head().context("This repository has no commits yet")?;
+    if !head.is_branch() {
+        bail!("You are not on a branch");
+    }
+    let local_branch = head.shorthand().unwrap_or_default().to_string();
+    let tip = head.peel_to_commit()?.id();
+    let cfg = repo.config()?.snapshot()?;
+
+    let (remote, remote_branch) = match publish {
+        Some((remote, branch)) => (remote.to_string(), branch.to_string()),
+        None => {
+            let key = |k: &str| cfg.get_string(&format!("branch.{local_branch}.{k}")).ok();
+            let fetch_remote = key("remote").context("This branch has no upstream")?;
+            let merge = key("merge").context("This branch has no upstream")?;
+            // Same order git uses to pick where `git push` goes.
+            let remote = key("pushremote").or_else(|| cfg.get_string("remote.pushdefault").ok()).unwrap_or(fetch_remote);
+            (remote, merge.trim_start_matches("refs/heads/").to_string())
+        }
+    };
+    let found = repo.find_remote(&remote).with_context(|| format!("There is no remote named '{remote}'"))?;
+    let url = match found.pushurl().ok().flatten() {
+        Some(u) => u.to_string(),
+        None => found.url().map(str::to_string).unwrap_or_default(),
+    };
+
+    let remote_tip = repo.refname_to_id(&format!("refs/remotes/{remote}/{remote_branch}")).ok();
+    let mut walk = repo.revwalk()?;
+    walk.push(tip)?;
+    match remote_tip {
+        Some(id) => walk.hide(id)?,
+        // A new branch: only what the remote has on none of its branches is new to it.
+        None => {
+            let _ = walk.hide_glob(&format!("refs/remotes/{remote}/*"));
+        }
+    }
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
+    let mut commits = Vec::new();
+    let mut total = 0;
+    for oid in walk {
+        total += 1;
+        if commits.len() < PUSH_PREVIEW_LIMIT {
+            commits.push(commit_info(&repo.find_commit(oid?)?));
+        }
+    }
+    let behind = match remote_tip {
+        Some(id) => repo.graph_ahead_behind(tip, id).map(|(_, b)| b).unwrap_or(0),
+        None => 0,
+    };
+    Ok(PushPreview { local_branch, remote, remote_branch, url, new_branch: remote_tip.is_none(), commits, total, behind })
 }
 
 /// When the last fetch from a remote ran, in seconds since the Unix epoch.
@@ -1134,6 +1215,47 @@ mod tests {
         assert_eq!((head.ahead, head.behind), (1, 2));
         assert_eq!(merge_preview(&repo, &format!("origin/{main}")).unwrap().commits, 2);
         assert!(last_fetch_time(&repo).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn push_preview_lists_what_the_remote_does_not_have() {
+        let (dir, repo) = tmp_repo();
+        let first = write_commit(&dir, &repo, "a.txt", "one\n", "First");
+        let main = head_info(&repo).branch.unwrap();
+        // Nothing to preview without an upstream, unless the branch is being published.
+        assert!(push_preview(&repo, None).is_err());
+        add_remote(&repo, "origin", "https://example.com/a/b.git").unwrap();
+        let publish = push_preview(&repo, Some(("origin", &main))).unwrap();
+        assert!(publish.new_branch);
+        assert_eq!((publish.total, publish.behind), (1, 0));
+        assert_eq!(publish.url, "https://example.com/a/b.git");
+
+        // The remote has the first commit and one we do not have; we add two.
+        let theirs = write_commit(&dir, &repo, "a.txt", "two\n", "Remote");
+        repo.reference(&format!("refs/remotes/origin/{main}"), theirs, true, "test").unwrap();
+        repo.find_branch(&main, BranchType::Local).unwrap().set_upstream(Some(&format!("origin/{main}"))).unwrap();
+        repo.reset(&repo.find_object(first, None).unwrap(), git2::ResetType::Hard, None).unwrap();
+        write_commit(&dir, &repo, "b.txt", "mine\n", "Mine 1");
+        let tip = write_commit(&dir, &repo, "b.txt", "more\n", "Mine 2");
+        set_remote_url(&repo, "origin", "https://example.com/a/b.git", Some("https://push.example.com/a/b.git")).unwrap();
+
+        let p = push_preview(&repo, None).unwrap();
+        assert_eq!((p.local_branch.as_str(), p.remote.as_str(), p.remote_branch.as_str()), (main.as_str(), "origin", main.as_str()));
+        assert_eq!(p.url, "https://push.example.com/a/b.git");
+        assert!(!p.new_branch);
+        assert_eq!((p.total, p.behind), (2, 1));
+        assert_eq!(p.commits[0].id, tip);
+        assert_eq!(p.commits[0].email, "test@example.com");
+        assert_eq!(p.commits.iter().map(|c| c.summary.as_str()).collect::<Vec<_>>(), ["Mine 2", "Mine 1"]);
+
+        // A new branch only sends what the remote has on none of its branches.
+        create_branch(&repo, "feature", true).unwrap();
+        write_commit(&dir, &repo, "c.txt", "new\n", "Feature");
+        let p = push_preview(&repo, Some(("origin", "feature"))).unwrap();
+        assert!(p.new_branch);
+        assert_eq!(p.total, 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

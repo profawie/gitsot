@@ -60,6 +60,19 @@ Click **Pull requests** in the ribbon. The list opens in a tab (*Open*, *Closed*
 - **Which account does the background check use?** The one Git already has for that repository. It is the same `git fetch` as the Fetch button, run inside the repository, so your credential helper, folder rules (`includeIf`) and SSH keys decide, exactly as on the command line. It **never asks for a password**, never opens a sign-in window and never uses a password typed into Gitsot. If no saved sign-in works, it stops quietly and the status bar shows *Last check failed* (rest the pointer on it for the reason); click Fetch to sign in.
 - To fetch only when you ask, turn off *Check for new commits in the background* in Settings → **Remote updates**.
 
+### Reviewing a push
+
+![The review shown before a push](docs/push-review.png)
+
+Clicking **Push** (or **Publish branch**) uploads nothing yet. Gitsot first shows what the push will send:
+
+- the branch and the remote branch it goes to, and the address of the remote (the push URL when the remote has one);
+- every commit that will be uploaded, with its short id, summary, author name and email;
+- when the repository is inside a folder with an identity rule, the identity expected there. A commit made with **another email is marked in red**, and the button changes from *Push* to *Push anyway*, so company and personal commits do not get mixed up by accident;
+- a note when the remote branch has commits you do not have yet, because the remote would refuse the push until you Pull.
+
+**Cancel** closes the review and leaves everything as it was.
+
 ### Merging
 
 ![The Merge dialog says how many commits will be merged](docs/merge.png)
