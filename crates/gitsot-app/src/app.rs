@@ -404,6 +404,9 @@ pub(crate) enum Action {
     /// Start a new terminal session in a repository (opening it first if
     /// needed) and show it in a new tab.
     OpenTerminal(PathBuf),
+    /// Show a folder in Explorer / Finder / the file manager, without
+    /// opening it as the current repository.
+    RevealPath(PathBuf),
     /// A new terminal tab for the open repository.
     NewTerminal,
     RestartTerminal,
@@ -679,6 +682,7 @@ impl GitsotApp {
                     self.new_terminal(ctx, &p);
                 }
             }
+            Action::RevealPath(p) => open_in_file_manager(&p),
             Action::NewTerminal => {
                 if let Some(path) = self.repo.as_ref().map(|r| r.path.clone()) {
                     self.new_terminal(ctx, &path);
@@ -1639,6 +1643,14 @@ fn default_clone_parent() -> Option<PathBuf> {
     Some(base.join("GitHub"))
 }
 
+/// What the OS calls showing a folder in its file manager.
+#[cfg(target_os = "windows")]
+const FILE_MANAGER_LABEL: &str = "Open in Explorer";
+#[cfg(target_os = "macos")]
+const FILE_MANAGER_LABEL: &str = "Open in Finder";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const FILE_MANAGER_LABEL: &str = "Open in file manager";
+
 fn open_in_file_manager(path: &Path) {
     #[cfg(target_os = "windows")]
     let cmd = "explorer";
@@ -2105,7 +2117,7 @@ impl GitsotApp {
                                 }
                             }
                         }
-                        let folder = egui::Label::new(RichText::new(format!("📁 {}", r.path.display())).weak()).truncate().sense(Sense::click());
+                        let folder = egui::Label::new(RichText::new(format!("🗀 {}", r.path.display())).weak()).truncate().sense(Sense::click());
                         if ui.add(folder).on_hover_text("Current folder. Click to show it in the file manager").clicked() {
                             actions.push(Action::RevealInFiles);
                         }
@@ -2172,7 +2184,7 @@ impl GitsotApp {
                         if button(ui, "🔄", "Refresh", true, false).on_hover_text("Read the repository again (F5)").clicked() {
                             actions.push(Action::Refresh);
                         }
-                        if button(ui, "📁", "Show folder", true, false).on_hover_text("Show this repository in the file manager").clicked() {
+                        if button(ui, "🗀", "Show folder", true, false).on_hover_text(format!("{FILE_MANAGER_LABEL}: show this repository's folder")).clicked() {
                             actions.push(Action::RevealInFiles);
                         }
                         if button(ui, "✖", "Close repo", true, false).on_hover_text("Close this repository (its terminals end)").clicked() {
@@ -3493,10 +3505,16 @@ fn repo_card_body(ui: &mut egui::Ui, card: &RepoCard, is_current: bool, width: f
         let label = if is_current { "Go to repository" } else { "Open" };
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let terminal = ui
-                    .add_enabled(card.exists, egui::Button::new(">_  Terminal").min_size(Vec2::new(0.0, 28.0)))
-                    .on_hover_text("Open a new terminal session in this repository");
-                if terminal.clicked() {
+                let icon = |ui: &mut egui::Ui, glyph: &str, tip: &str| {
+                    ui.add_enabled(card.exists, egui::Button::new(RichText::new(glyph).size(14.0)).min_size(Vec2::new(32.0, 28.0)))
+                        .on_hover_text(tip)
+                        .on_disabled_hover_text("Folder not found")
+                };
+                // Right to left: the folder icon ends up at the far right.
+                if icon(ui, "🗀", FILE_MANAGER_LABEL).clicked() {
+                    actions.push(Action::RevealPath(card.path.clone()));
+                }
+                if icon(ui, ">_", "Terminal: open a new terminal session in this repository").clicked() {
                     actions.push(Action::OpenTerminal(card.path.clone()));
                 }
                 if theme::primary_wide(ui, card.exists, label, 28.0).clicked() {
@@ -4393,6 +4411,10 @@ fn history_column(ui: &mut egui::Ui, r: &mut RepoView, tree: bool, actions: &mut
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("🗀  Go to files").on_hover_text(format!("{FILE_MANAGER_LABEL}: show this repository's folder")).clicked() {
+                    actions.push(Action::RevealInFiles);
+                    ui.close();
+                }
                 if ui.button("Copy commit id").clicked() {
                     actions.push(Action::CopyToClipboard(c.id.to_string()));
                     ui.close();
