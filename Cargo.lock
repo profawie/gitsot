@@ -894,14 +894,14 @@ dependencies = [
 
 [[package]]
 name = "gitsot"
-version = "0.3.7"
+version = "0.4.0"
 dependencies = [
  "libloading",
 ]
 
 [[package]]
 name = "gitsot-app"
-version = "0.3.7"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -910,19 +910,50 @@ dependencies = [
  "egui",
  "git2",
  "gitsot-core",
+ "gitsot-forge",
+ "gitsot-term",
  "rfd",
  "serde",
 ]
 
 [[package]]
 name = "gitsot-core"
-version = "0.3.7"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "git2",
+ "gitsot-shared",
+]
+
+[[package]]
+name = "gitsot-forge"
+version = "0.4.0"
+dependencies = [
+ "gitsot-core",
+ "gitsot-shared",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "gitsot-shared"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.2",
+ "libc",
+ "log",
+ "memchr",
+ "serde",
+]
+
+[[package]]
+name = "gitsot-term"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
- "git2",
- "serde",
- "serde_json",
+ "gitsot-shared",
 ]
 
 [[package]]

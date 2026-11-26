@@ -1,13 +1,15 @@
 [package]
 name = "gitsot-core"
-description = "gitsot core: Git, identities, history graph and terminal logic (no UI)"
+description = "gitsot core: Git, identities and the history graph (no UI), built as gitsot_core.dll"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[lib]
+# gitsot_core.dll (Windows), libgitsot_core.dylib (macOS), libgitsot_core.so (Linux).
+crate-type = ["dylib"]
+
 [dependencies]
+gitsot-shared.workspace = true
 git2.workspace = true
 anyhow.workspace = true
-alacritty_terminal.workspace = true
-serde.workspace = true
-serde_json.workspace = true

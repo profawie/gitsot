@@ -1,0 +1,23 @@
+[package]
+name = "gitsot-shared"
+description = "Third-party libraries used by more than one gitsot library, built as gitsot_shared.dll"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+# gitsot_shared.dll (Windows), libgitsot_shared.dylib (macOS), libgitsot_shared.so (Linux).
+crate-type = ["dylib"]
+
+# Every crate below is used by two or more of gitsot-core, gitsot-term and
+# gitsot-forge (directly or through another library). Rust can put a library
+# into only one of gitsot's DLLs, so they live here, below all of them.
+# If a build fails with "cannot satisfy dependencies so `<crate>` only shows
+# up once", add that crate here and to src/lib.rs.
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+bitflags = { version = "2", default-features = false }
+libc = { version = "0.2", default-features = false }
+log = { version = "0.4", default-features = false }
+memchr = { version = "2", default-features = false }

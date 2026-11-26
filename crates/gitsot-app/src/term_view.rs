@@ -12,7 +12,7 @@ use alacritty_terminal::{
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 
-use gitsot_core::term::{self, Key, KeyModifiers, Palette, Size, Terminal};
+use gitsot_term::term::{self, Key, KeyModifiers, Palette, Size, Terminal};
 
 use crate::theme;
 

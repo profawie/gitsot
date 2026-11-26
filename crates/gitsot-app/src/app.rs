@@ -10,17 +10,17 @@ use git2::{Oid, Repository};
 use serde::{Deserialize, Serialize};
 
 use gitsot_core::cli::{self, CheckResult, Credentials, NetOp, NetResult};
-use gitsot_core::forge::{self, Filter, ReviewEvent};
+use gitsot_forge::{self as forge, Filter, ReviewEvent};
 use gitsot_core::git::{
     self, BranchInfo, ChangeKind, CommitFile, CommitInfo, FileChange, FileDiff, HeadInfo, LineKind, RefKind,
     RefLabel,
 };
 use gitsot_core::graph::{self, Graph};
 use gitsot_core::identity::{self, FolderRule, Identity};
-use gitsot_core::term::Terminal;
+use gitsot_term::term::Terminal;
 use crate::pulls::{self, Load, PullTab, Pulls};
 use crate::{term_view, theme};
-use gitsot_core::shell;
+use gitsot_term::shell;
 use std::collections::HashMap;
 
 const SETTINGS_KEY: &str = "gitsot-settings";
@@ -790,7 +790,7 @@ impl GitsotApp {
                     .set_title("Choose a folder for the new repository")
                     .pick_folder()
                 {
-                    if Repository::open(&dir).is_ok() {
+                    if git::is_repository(&dir) {
                         self.open_repo(&dir);
                     } else {
                         match git::init(&dir) {

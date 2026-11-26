@@ -12,11 +12,15 @@
 
   The GNU Rust toolchain is installed automatically if missing.
 
-  Output: dist\gitsot, a folder with every file gitsot needs:
-    gitsot.exe   the small launcher you start
-    gitsot.dll   the application itself (UI, Git, terminal)
-    + any MinGW runtime DLLs the two files import (usually none, because
-      Rust links them statically)
+  Output: dist, a folder with every file gitsot needs:
+    gitsot.exe          the small launcher you start
+    gitsot.dll          the application: window and the whole UI
+    gitsot_core.dll     Git, identities and the history graph
+    gitsot_term.dll     the built-in terminal
+    gitsot_forge.dll    pull requests on the Git host
+    gitsot_shared.dll   third-party libraries the gitsot DLLs share
+    std-<hash>.dll      the Rust standard library, shared by all of them
+    libgcc_s_seh-1.dll  the MinGW runtime (+ any other MinGW DLL imported)
   Copy the whole folder to another PC and run gitsot.exe from there.
 
 .EXAMPLE
@@ -86,7 +90,7 @@ if ($LASTEXITCODE -ne 0) { Fail 'build failed' }
 
 # Assemble the release folder.
 $Built = "target\$Target\$BuildProfile"
-$Out   = 'dist\gitsot'
+$Out   = 'dist'
 if (Test-Path $Out) {
     try {
         Remove-Item -Recurse -Force $Out
@@ -95,33 +99,42 @@ if (Test-Path $Out) {
     }
 }
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
-Copy-Item "$Built\gitsot.exe" "$Out\gitsot.exe" -Force
-Copy-Item "$Built\gitsot.dll" "$Out\gitsot.dll" -Force
 
-# Copy the MinGW runtime DLLs (libgcc, libwinpthread, ...) that a file
-# imports, if any. DLLs that are not in the MinGW folder are part of Windows.
+# Folders a DLL may come from: this build, the Rust standard library
+# (std-<hash>.dll) and MinGW (libgcc_s_seh-1.dll and friends).
+$RustLib  = (& rustup run $Toolchain rustc --print target-libdir --target $Target).Trim()
+$RustBin  = Join-Path (& rustup run $Toolchain rustc --print sysroot).Trim() 'bin'
 $MingwBin = Split-Path -Parent (Get-Command gcc).Source
+$DllDirs  = @($Built, $RustLib, $RustBin, $MingwBin)
 $Objdump  = Join-Path $MingwBin 'objdump.exe'
-function Copy-RuntimeDlls([string]$File) {
+if (-not (Test-Path $Objdump)) {
+    Fail "objdump.exe not found in $MingwBin. Install it: C:\msys64\usr\bin\pacman.exe -S --needed mingw-w64-x86_64-binutils"
+}
+
+# Copy a file into dist, then every DLL it imports that is found in $DllDirs,
+# and so on for those. DLLs that are found nowhere are part of Windows.
+function Copy-WithDlls([string]$File) {
+    $name = Split-Path -Leaf $File
+    if (-not (Test-Path (Join-Path $Out $name))) { Copy-Item $File (Join-Path $Out $name) -Force }
     $imports = & $Objdump -p $File | Select-String -Pattern '^\s*DLL Name: (.+)$' |
         ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() } | Sort-Object -Unique
     foreach ($dll in $imports) {
-        $dest = Join-Path $Out $dll
-        if (Test-Path $dest) { continue }
-        $src = Join-Path $MingwBin $dll
-        if (-not (Test-Path $src)) { continue }
-        Write-Host "    + $dll"
-        Copy-Item $src $dest -Force
-        Copy-RuntimeDlls $dest
+        if (Test-Path (Join-Path $Out $dll)) { continue }
+        foreach ($dir in $DllDirs) {
+            $src = Join-Path $dir $dll
+            if (Test-Path $src) {
+                Copy-WithDlls $src
+                break
+            }
+        }
     }
 }
-Write-Host '==> Collecting runtime DLLs'
-if (Test-Path $Objdump) {
-    Copy-RuntimeDlls "$Out\gitsot.exe"
-    Copy-RuntimeDlls "$Out\gitsot.dll"
-} else {
-    Write-Host "    objdump.exe not found in $MingwBin, skipping (install mingw-w64-x86_64-binutils)" -ForegroundColor Yellow
-}
+Write-Host '==> Collecting DLLs'
+Copy-WithDlls "$Built\gitsot.exe"
+# The launcher loads gitsot.dll at run time, so it is not in its imports.
+Copy-WithDlls "$Built\gitsot.dll"
 
-Write-Host "==> Done: $Out" -ForegroundColor Green
-Get-ChildItem $Out | ForEach-Object { Write-Host "    $($_.Name)" }
+Write-Host "==> Done: $Out\" -ForegroundColor Green
+Get-ChildItem $Out | Sort-Object Name | ForEach-Object {
+    Write-Host ('    {0,-28} {1,8:N0} KB' -f $_.Name, [math]::Ceiling($_.Length / 1KB))
+}

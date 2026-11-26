@@ -9,10 +9,12 @@ publish.workspace = true
 # The output file is gitsot.dll (Windows), libgitsot.so (Linux) or
 # libgitsot.dylib (macOS). The `gitsot` executable loads it at start-up.
 name = "gitsot"
-crate-type = ["cdylib"]
+crate-type = ["dylib"]
 
 [dependencies]
 gitsot-core.workspace = true
+gitsot-term.workspace = true
+gitsot-forge.workspace = true
 eframe.workspace = true
 egui.workspace = true
 git2.workspace = true
