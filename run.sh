@@ -26,8 +26,8 @@ cd "$(dirname "$0")"
 ./build.sh ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}
 
 if [ "$(uname -s)" = "Darwin" ]; then
-  EXE=dist/gitsot/gitsot.app/Contents/MacOS/gitsot
+  EXE=dist/gitsot.app/Contents/MacOS/gitsot
 else
-  EXE=dist/gitsot/gitsot
+  EXE=dist/gitsot
 fi
 exec "$EXE" ${ARGS[@]+"${ARGS[@]}"}

@@ -27,7 +27,7 @@ Set-Location -Path $PSScriptRoot
 & "$PSScriptRoot\build.ps1" -Dev:$Dev
 if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) { exit $LASTEXITCODE }
 
-$exe = Join-Path $PSScriptRoot 'dist\gitsot\gitsot.exe'
+$exe = Join-Path $PSScriptRoot 'dist\gitsot.exe'
 if ($repoPath) {
     Start-Process -FilePath $exe -ArgumentList "`"$repoPath`""
 } else {

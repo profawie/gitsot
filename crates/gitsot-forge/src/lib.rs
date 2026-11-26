@@ -10,6 +10,13 @@
 //! macOS, the same way network Git operations use the installed `git`. That
 //! keeps the system certificate store and proxy settings working. Secrets are
 //! passed on curl's standard input, never on a command line.
+//!
+//! Built as a dynamic library: `gitsot_forge.dll` on Windows,
+//! `libgitsot_forge.dylib` on macOS and `libgitsot_forge.so` on Linux.
+
+// Use the third-party libraries inside gitsot_shared instead of linking our
+// own copies (see crates/gitsot-shared).
+extern crate gitsot_shared;
 
 use std::io::Write;
 use std::path::Path;
@@ -17,8 +24,8 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::cli::{self, Credentials};
-use crate::git::{ChangeKind, DiffLine, FileDiff, LineKind};
+use gitsot_core::cli::{self, Credentials};
+use gitsot_core::git::{ChangeKind, DiffLine, FileDiff, LineKind};
 
 /// Most files read for one pull request (three pages of 100).
 pub const MAX_FILES: usize = 300;

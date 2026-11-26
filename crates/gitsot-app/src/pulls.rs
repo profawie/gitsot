@@ -1,5 +1,5 @@
 //! Pull requests: the list tab, one tab per pull request, and the review and
-//! sign-in dialogs. The host is reached through `gitsot_core::forge`, so
+//! sign-in dialogs. The host is reached through `gitsot_forge`, so
 //! nothing here knows which Git host it is talking to.
 
 use std::path::PathBuf;
@@ -7,7 +7,7 @@ use std::sync::mpsc::Sender;
 
 use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke, TextEdit, Vec2};
 
-use gitsot_core::forge::{self, Filter, Kind, PullDetail, PullState, PullSummary, Remote, ReviewEvent, ReviewState};
+use gitsot_forge::{self as forge, Filter, Kind, PullDetail, PullState, PullSummary, Remote, ReviewEvent, ReviewState};
 
 use crate::app::{diff_view, file_row, full_time, kind_badge, relative_time, Action};
 use crate::theme;

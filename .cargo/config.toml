@@ -1,0 +1,25 @@
+# gitsot is built as one small program plus one dynamic library per crate
+# (gitsot.dll, gitsot_core.dll, gitsot_term.dll, gitsot_forge.dll on
+# Windows; .dylib on macOS; .so on Linux).
+#
+# `-C prefer-dynamic` makes every one of them share the Rust standard
+# library as its own dynamic library (std-<hash>.dll / libstd-<hash>.dylib)
+# instead of each carrying a copy. Rust requires this when several Rust
+# dynamic libraries are loaded together.
+#
+# The rpath settings let the program and libraries find each other in the
+# same folder (and, on macOS, in the app bundle's Contents/Frameworks).
+# On Windows nothing is needed: Windows looks next to the program first.
+
+[target.'cfg(windows)']
+rustflags = ["-C", "prefer-dynamic"]
+
+[target.'cfg(target_os = "macos")']
+rustflags = [
+    "-C", "prefer-dynamic",
+    "-C", "link-arg=-Wl,-rpath,@loader_path",
+    "-C", "link-arg=-Wl,-rpath,@executable_path/../Frameworks",
+]
+
+[target.'cfg(all(unix, not(target_os = "macos")))']
+rustflags = ["-C", "prefer-dynamic", "-C", "link-arg=-Wl,-rpath,$ORIGIN"]

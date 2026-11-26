@@ -185,6 +185,11 @@ pub fn open(path: &Path) -> Result<Repository> {
     Ok(repo)
 }
 
+/// Whether `path` is the top folder of a Git repository (bare or not).
+pub fn is_repository(path: &Path) -> bool {
+    Repository::open(path).is_ok()
+}
+
 pub fn init(path: &Path) -> Result<Repository> {
     std::fs::create_dir_all(path)?;
     let repo = Repository::init(path)?;

@@ -46,7 +46,7 @@ Clone, fetch, pull and push use the `git` command installed on your computer, so
 Click **Pull requests** in the ribbon. The list opens in a tab (*Open*, *Closed*, *All*); click a pull request and it opens in its own tab with its description, reviews and comments, the changed files and their diffs. The ribbon then has **Approve**, **Request changes** and **Comment**. Each asks for your comment and shows **which account the review is made as** before anything is sent.
 
 - **Which account?** For an HTTPS remote, gitsot uses the sign-in Git has saved for that remote, so you review as the account that pushes. For an SSH remote (or to use another account) click *Sign in* and enter an access token. The token is kept in memory for the session and is never saved. The ribbon always shows *Reviewing as @name*.
-- **Which hosts?** Pull requests go through a small provider interface (`crates/gitsot-core/src/forge.rs`), so the rest of gitsot does not know which host it talks to. This version has a provider for **GitHub** (github.com and GitHub Enterprise; for an Enterprise server with its own name, open Pull requests once and click *… is a GitHub Enterprise server*). GitLab, Gitea / Forgejo and Bitbucket are recognised and reported as not supported yet.
+- **Which hosts?** Pull requests go through a small provider interface (`crates/gitsot-forge/src/lib.rs`), so the rest of gitsot does not know which host it talks to. This version has a provider for **GitHub** (github.com and GitHub Enterprise; for an Enterprise server with its own name, open Pull requests once and click *… is a GitHub Enterprise server*). GitLab, Gitea / Forgejo and Bitbucket are recognised and reported as not supported yet.
 - **How?** Requests are sent with the `curl` command that ships with Windows 10+ and macOS, so the system certificates and proxy settings apply. gitsot still never uses `gh`.
 - Not in this version: comments on single lines of a diff, merging or closing a pull request, and creating one.
 
@@ -163,7 +163,7 @@ Good to know:
 ### Windows (PowerShell)
 
 ```powershell
-.\build.ps1                     # release build -> dist\gitsot\
+.\build.ps1                     # release build -> dist\
 .\build.ps1 -Dev                # debug build
 .\run.ps1                       # build and start
 .\run.ps1 C:\work\my-project    # build and open a specific repository
@@ -174,44 +174,65 @@ If PowerShell blocks the scripts, run once: `Set-ExecutionPolicy -Scope CurrentU
 ### macOS / Linux
 
 ```bash
-./build.sh                # release build -> dist/gitsot/
+./build.sh                # release build -> dist/
 ./build.sh --debug        # debug build
-./build.sh --windows      # cross-compile for Windows -> dist/gitsot/ (needs mingw-w64)
+./build.sh --windows      # cross-compile for Windows -> dist/ (needs mingw-w64)
 ./run.sh                  # build and start
 ./run.sh ~/code/project   # build and open a specific repository
 ```
 
 ### The release folder
 
-Every build puts a ready-to-use release in `dist/gitsot`. It holds every file gitsot needs, so you can copy that one folder anywhere (another drive, another computer) and run gitsot from there:
+Every build puts a ready-to-use release in `dist`. It holds every file gitsot needs, so you can copy that one folder anywhere (another drive, another computer) and run gitsot from there. Each gitsot library is its own DLL:
 
-| Platform | Contents of `dist/gitsot` |
-| --- | --- |
-| Windows | `gitsot.exe` (the program you start, with the gitsot icon) and `gitsot.dll` (the application) |
-| macOS | `gitsot.app`, with `libgitsot.dylib` inside `Contents/Frameworks` |
-| Linux | `gitsot` (the program you start) and `libgitsot.so` (the application) |
+| File (Windows) | macOS / Linux | What it is |
+| --- | --- | --- |
+| `gitsot.exe` | `gitsot` | The program you start (with the gitsot icon on Windows) |
+| `gitsot.dll` | `libgitsot.dylib` / `.so` | The application: window and the whole UI |
+| `gitsot_core.dll` | `libgitsot_core.dylib` / `.so` | Git, identities and the history graph |
+| `gitsot_term.dll` | `libgitsot_term.dylib` / `.so` | The built-in terminal |
+| `gitsot_forge.dll` | `libgitsot_forge.dylib` / `.so` | Pull requests on the Git host |
+| `gitsot_shared.dll` | `libgitsot_shared.dylib` / `.so` | Third-party libraries that more than one gitsot DLL uses |
+| `std-<hash>.dll` | `libstd-<hash>.dylib` / `.so` | The Rust standard library, shared by all of the above |
+| `libgcc_s_seh-1.dll` | | The MinGW runtime (Windows only). Any other MinGW DLL the files import is copied too |
 
-Keep the files together: the program looks for the library in its own folder. On Windows no MinGW DLLs are normally needed, because Rust links them statically; if your MinGW setup does need some (for example `libwinpthread-1.dll`), `build.ps1` and `build.sh --windows` find them and copy them into the folder too.
+On macOS `dist` holds `gitsot.app`, with the libraries inside `Contents/Frameworks`.
+
+Keep the files together: the program and libraries look for each other in their own folder. All of them come from one build, so always copy the whole folder, never a single DLL: a DLL from another build or another Rust version will not load.
 
 ## Project layout
 
-gitsot is a Cargo workspace with three crates, built the way desktop applications usually are: a small executable that loads one shared library.
+gitsot is a Cargo workspace. Every library crate is built as its own dynamic library, so a release is one small program and a set of DLLs.
 
 ```
-gitsot.exe ──loads──▶ gitsot.dll ──contains──▶ gitsot-core
-(launcher)            (gitsot-app: the UI)     (Git, identities, terminal, pull requests)
+gitsot.exe ──loads──▶ gitsot.dll ──uses──▶ gitsot_core.dll ──┐
+(launcher)            (the UI)     ├─────▶ gitsot_term.dll  ──┼──▶ gitsot_shared.dll ──▶ std-<hash>.dll
+                                   └─────▶ gitsot_forge.dll ──┘
+                                           (uses gitsot_core.dll too)
 ```
 
 | Crate | Builds | What it does |
 | --- | --- | --- |
-| `crates/gitsot` | `gitsot.exe` / `gitsot` | The launcher. Finds the library next to itself, checks it is the same version, and starts it. Shows a message if the library is missing. |
-| `crates/gitsot-app` | `gitsot.dll` / `libgitsot.so` / `libgitsot.dylib` | The application: window and the whole UI. Exports `gitsot_main` and `gitsot_version` with a C interface. |
-| `crates/gitsot-core` | Rust library (linked into the dll) | Everything that is not UI. No dependency on the UI toolkit, so it can be tested on its own. |
+| `crates/gitsot` | `gitsot.exe` | The launcher. Finds `gitsot.dll` next to itself, checks it is the same version, and starts it. Shows a message if the library is missing. |
+| `crates/gitsot-app` | `gitsot.dll` | The application: window and the whole UI. Exports `gitsot_main` and `gitsot_version` with a C interface for the launcher. |
+| `crates/gitsot-core` | `gitsot_core.dll` | Local Git (libgit2), network Git operations through the `git` command, identities, the history graph. No UI. |
+| `crates/gitsot-term` | `gitsot_term.dll` | The built-in terminal: shell, pseudo-terminal and screen. No UI. |
+| `crates/gitsot-forge` | `gitsot_forge.dll` | Pull requests on the Git host (GitHub provider). No UI. |
+| `crates/gitsot-shared` | `gitsot_shared.dll` | No code of its own: holds the third-party libraries (`anyhow`, `serde`, `libc`, ...) that two or more gitsot DLLs use, because Rust can put a library into only one DLL. |
+
+How the DLLs are made (`.cargo/config.toml` and the workspace `Cargo.toml`):
+
+- The library crates use `crate-type = ["dylib"]`, Rust's own dynamic library format. The DLLs call each other with normal Rust functions and types, so they must all come from the same build and the same Rust version. The build scripts always build and copy them together.
+- `-C prefer-dynamic` makes them share one Rust standard library (`std-<hash>.dll`) instead of each having a copy. On Windows this also makes `libgcc_s_seh-1.dll` (MinGW) a separate file.
+- Release builds no longer use LTO, which Rust cannot do across DLLs. The total size is a bit larger than the old single DLL.
+- If a build fails with `cannot satisfy dependencies so '<crate>' only shows up once`, two gitsot DLLs both started to use that third-party crate: add it to `crates/gitsot-shared`.
+- `gitsot-app` must not call generic `git2` functions such as `git2::Repository::open` directly: their code would end up in `gitsot.dll`, but libgit2 itself is inside `gitsot_core.dll` and not exported, so the link fails. Add a small function to `gitsot-core` instead (for example `git::is_repository`).
 
 | File | What it does |
 | --- | --- |
 | `crates/gitsot/src/main.rs` | The launcher |
 | `crates/gitsot/build.rs`, `assets/gitsot.rc`, `assets/gitsot.ico` | Put the gitsot icon into `gitsot.exe` on Windows (compiled with MinGW's `windres`). The `.ico` is generated from the logo by a test in `theme.rs` |
+| `crates/gitsot-shared/src/lib.rs` | Re-exports the shared third-party libraries so they are part of `gitsot_shared.dll` |
 | `crates/gitsot-app/src/lib.rs` | Window setup and the exported entry points |
 | `crates/gitsot-app/src/app.rs` | Most of the UI: ribbon, tabs, the three columns (changes, history, commit), repository cards, settings, dialogs, diff viewer |
 | `crates/gitsot-app/src/pulls.rs` | Pull requests: the list tab, one tab per pull request, the review and sign-in dialogs |
@@ -221,10 +242,10 @@ gitsot.exe ──loads──▶ gitsot.dll ──contains──▶ gitsot-core
 | `crates/gitsot-core/src/identity.rs` | Global/repository identities, folder rules (`includeIf`) and mismatch checks |
 | `crates/gitsot-core/src/graph.rs` | Lays out the history tree (lanes and branch lines) |
 | `crates/gitsot-core/src/cli.rs` | Network operations through the `git` command, run in the background |
-| `crates/gitsot-core/src/forge.rs` | Pull requests on the Git host: the provider interface, the GitHub provider, requests through `curl` |
-| `crates/gitsot-core/src/term.rs` | One built-in terminal: the shell in a pseudo-terminal and its screen (`alacritty_terminal`) |
-| `crates/gitsot-core/src/shell.rs` | Picks the shell (PowerShell / zsh / bash) and loads the Gitsot prompt into it |
-| `crates/gitsot-core/assets/prompt.ps1`, `prompt.sh` | The Gitsot prompt for PowerShell and for zsh/bash |
+| `crates/gitsot-forge/src/lib.rs` | Pull requests on the Git host: the provider interface, the GitHub provider, requests through `curl` |
+| `crates/gitsot-term/src/term.rs` | One built-in terminal: the shell in a pseudo-terminal and its screen (`alacritty_terminal`) |
+| `crates/gitsot-term/src/shell.rs` | Picks the shell (PowerShell / zsh / bash) and loads the Gitsot prompt into it |
+| `crates/gitsot-term/assets/prompt.ps1`, `prompt.sh` | The Gitsot prompt for PowerShell and for zsh/bash |
 
 ## Tests
 

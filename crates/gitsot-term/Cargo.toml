@@ -1,0 +1,15 @@
+[package]
+name = "gitsot-term"
+description = "gitsot terminal: shell, pseudo-terminal and screen (no UI), built as gitsot_term.dll"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+# gitsot_term.dll (Windows), libgitsot_term.dylib (macOS), libgitsot_term.so (Linux).
+crate-type = ["dylib"]
+
+[dependencies]
+gitsot-shared.workspace = true
+anyhow.workspace = true
+alacritty_terminal.workspace = true
